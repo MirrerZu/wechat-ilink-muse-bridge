@@ -57,6 +57,11 @@ class MainLoopHarness(unittest.TestCase):
         self._orig_collect = daemon.collect_burst
         self._orig_handle = daemon.handle_burst
         self._orig_argv = sys.argv
+        # The shared driver gate is tested separately (test_driver_lock)
+        # and must not make this suite depend on the live hook's
+        # heartbeat in ~/hooks/state: stub it out here.
+        self._orig_gate = daemon.acquire_driver_lock_or_exit
+        daemon.acquire_driver_lock_or_exit = lambda: None
         sys.argv = ["daemon.py"]
         daemon.poll_once = self._fake_poll
         # Burst collecting is not under test here: pass rounds through.
@@ -67,6 +72,7 @@ class MainLoopHarness(unittest.TestCase):
         daemon.poll_once = self._orig_poll
         daemon.collect_burst = self._orig_collect
         daemon.handle_burst = self._orig_handle
+        daemon.acquire_driver_lock_or_exit = self._orig_gate
         sys.argv = self._orig_argv
 
     def _fake_poll(self):

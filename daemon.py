@@ -47,6 +47,14 @@ Environment:
   MERGE_WINDOW   idle-gap seconds for burst collecting (default 25;
                  approximate, not a strict cap — see collect_burst)
   ILINK_DATA_DIR data dir forwarded to ilink.py (default ./data)
+  ILINK_HOOK_STATE_DIR
+                 hook state dir holding ilink-driver.lock and
+                 ilink-heartbeat (legacy ILINK_HOOK_STATE also honored;
+                 default ~/hooks/state). The hook driver must use the
+                 same dir, or the shared driver lock does not apply.
+  ILINK_DRIVER_HEARTBEAT_STALE_SECS
+                 hook-heartbeat freshness window for the daemon
+                 startup gate (default 120)
   LLM_API_KEY    API key for --llm mode (required there)
   LLM_BASE_URL   OpenAI-compatible base URL (default https://api.openai.com/v1)
   LLM_MODEL      model name (default gpt-4o-mini)
@@ -62,8 +70,146 @@ import traceback
 import urllib.error
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # non-Unix platforms have no flock; see below
+    fcntl = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MERGE_WINDOW = float(os.environ.get("MERGE_WINDOW", "25"))
+
+# Shared driver lock (daemon vs. the Muse hook driver). Previously the
+# "hook and daemon must not run together" rule lived only in AGENTS.md
+# prose, and nothing stopped an accidental second driver from polling
+# the same account: wasted compute, double wakes, and two drivers
+# fighting over the same batches (the send ledger usually, but not
+# always, caught the duplicate replies). Now the rule is a lock:
+#
+#   * The lock file is $STATE_DIR/ilink-driver.lock, where STATE_DIR is
+#     the hook state dir (ILINK_HOOK_STATE_DIR, legacy ILINK_HOOK_STATE,
+#     or ~/hooks/state — the same canonical dir `ilink.py health`
+#     inspects). Both drivers MUST point at the same state dir, or
+#     they are not sharing a lock at all.
+#   * The daemon holds the lock for its whole lifetime (non-blocking
+#     acquire at startup; a held lock means another driver — daemon or
+#     hook — is already running, so this daemon exits with code 2).
+#   * The hook holds the same lock only for the duration of one run
+#     (it is a short-lived script, not a resident process). A hook run
+#     that cannot acquire it exits quietly WITHOUT touching the
+#     heartbeat, polling, or waking — the daemon keeps the driver role
+#     until it stops.
+#   * The daemon ALSO refuses to start when the hook heartbeat
+#     (ilink-heartbeat, touched by every hook run) is fresh, because
+#     a hook run holds the driver lock only intermittently: checking
+#     the lock alone at daemon startup would let the daemon steal the
+#     driver role in a gap between hook runs. First driver wins;
+#     latecomers stay quiet. The daemon never touches the heartbeat
+#     itself — that file is the hook's liveness signal, and a daemon
+#     refreshing it would fool the next daemon startup into thinking
+#     the hook is alive.
+DRIVER_LOCK_NAME = "ilink-driver.lock"
+HOOK_HEARTBEAT_NAME = "ilink-heartbeat"
+HOOK_HEARTBEAT_STALE_SECS = float(
+    os.environ.get("ILINK_DRIVER_HEARTBEAT_STALE_SECS", "120"))
+
+
+def hook_state_dir():
+    """Hook state dir, with the same precedence as the hook script."""
+    return (
+        os.environ.get("ILINK_HOOK_STATE_DIR")
+        or os.environ.get("ILINK_HOOK_STATE")
+        or os.path.expanduser("~/hooks/state")
+    )
+
+
+def hook_heartbeat_fresh(state_dir=None, stale_secs=HOOK_HEARTBEAT_STALE_SECS,
+                         now=None):
+    """True iff the hook driver touched its heartbeat recently.
+
+    Missing, unreadable, or stale heartbeat files mean "hook not
+    running" — never an error. `now` is injectable for tests.
+    """
+    if state_dir is None:
+        state_dir = hook_state_dir()
+    try:
+        mtime = os.path.getmtime(os.path.join(state_dir, HOOK_HEARTBEAT_NAME))
+    except OSError:
+        return False
+    if now is None:
+        now = time.time()
+    return (now - mtime) <= stale_secs
+
+
+def try_acquire_driver_lock(lock_path):
+    """Non-blocking exclusive flock on lock_path.
+
+    Returns the open file object (the caller must keep it alive for as
+    long as the lock must be held — closing it releases the lock), or
+    None when another process already holds the lock. Raises OSError
+    for anything else (missing directory, permission denied, no flock
+    support), so the caller can decide on a fallback instead of
+    silently running unlocked.
+    """
+    if fcntl is None:
+        raise OSError("fcntl unavailable on this platform")
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    except OSError:
+        f.close()
+        raise
+    return f
+
+
+def acquire_driver_lock_or_exit():
+    """Daemon startup gate: refuse to run if another driver is active.
+
+    Returns the held lock file object on success (kept alive by the
+    caller for the daemon's lifetime). Exits with code 2 when another
+    driver wins, and continues WITHOUT a shared lock (with a warning)
+    only when no lock file can be created anywhere — the example
+    daemon must still work for users with no hook runtime at all.
+    """
+    state_dir = hook_state_dir()
+    if hook_heartbeat_fresh(state_dir):
+        print("DRIVER_LOCK: hook driver is active (fresh ilink-heartbeat "
+              f"in {state_dir}); refusing to start daemon. Stop the hook "
+              "driver first if you really want the daemon.", flush=True)
+        sys.exit(2)
+    lock_path = os.path.join(state_dir, DRIVER_LOCK_NAME)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        lock = try_acquire_driver_lock(lock_path)
+        if lock is None:
+            print("DRIVER_LOCK: another driver already holds "
+                  f"{lock_path}; refusing to start.", flush=True)
+            sys.exit(2)
+        return lock
+    except OSError as e:
+        # State dir unusable: fall back to a data-dir lock. It still
+        # blocks a second daemon, but the hook (which only checks the
+        # state dir) will NOT see it — documented limitation, and the
+        # warning says so instead of pretending otherwise.
+        fallback = os.path.join(DATA_DIR, DRIVER_LOCK_NAME)
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            lock = try_acquire_driver_lock(fallback)
+            if lock is None:
+                print("DRIVER_LOCK: another daemon already holds "
+                      f"{fallback}; refusing to start.", flush=True)
+                sys.exit(2)
+            print("DRIVER_LOCK: state dir unusable "
+                  f"({e}); using fallback lock {fallback} "
+                  "(the hook driver will not see it).", flush=True)
+            return lock
+        except OSError as e2:
+            print("DRIVER_LOCK: cannot acquire any driver lock "
+                  f"({e2}); continuing without a shared lock.",
+                  flush=True)
+            return None
 
 
 def poll_once():
@@ -329,6 +475,11 @@ def main():
             flush=True,
         )
         sys.exit(1)
+    # Shared driver lock: refuse to become a second driver. The held
+    # lock object must stay alive for the daemon's lifetime (closing
+    # it releases the flock), so it is kept in a module-global.
+    global _driver_lock
+    _driver_lock = acquire_driver_lock_or_exit()
     backoff = 1
     handle_failures = 0
     noticed_expired = False

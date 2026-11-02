@@ -92,6 +92,12 @@ Muse 的主聊天里说一句"把待批名单里的加进白名单"，它会把�
   快照，不调服务端）、`preflight`（登录前环境预检）、`smoke-test`
   （端到端冒烟自检）、`prune-media`（媒体保留清理）、`rotate-chatlog`
   （往月对话记录归档），详见下方速查表
+- **打磨拟人化的回复** — 回复先像人打字：长句拆成短句，先给结论
+  再说细节，说大白话、不用模板套话；内容自然分段时拆成 2~3 个短
+  气泡（先接一句、再说正事、最后问一句），不把一句话硬切成两半；
+  情绪不跳变、隔夜隔天自然接续；发之前按语气、长度、用词、结构、
+  情感直接度自检一遍。复杂技术内容仍允许长句保真，短句默认不压
+  倒准确。详见 `AGENTS.md` 回复形态条款
 
 ## 出站消息的 Markdown 渲染
 
@@ -145,6 +151,11 @@ Claude Code 类（[crazynomad/weixin-claude-bot](https://github.com/crazynomad/w
 > 后才提交游标，崩溃或 handler 异常的窗口内同一批消息会被重投（至少一次、
 > 可能重复），不承诺生产级可靠。需要生产级投递（落盘队列、崩溃恢复、告警
 > 闭环）请用 hook 驱动。
+
+两种驱动只能二选一跑，本仓库用共享驱动锁（状态目录下的
+`ilink-driver.lock`）强制执行：先跑起来的驱动赢，后到的安静让路
+（hook 被挡时不 touch 心跳、不 poll、不 wake；daemon 被挡时拒绝启动）。
+`ilink-watch.lock` 只防 hook 自己重叠，与驱动锁分工不同。
 
 ## 快速开始
 
@@ -297,6 +308,24 @@ python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
 `data/unknown_senders.json` 待你人工确认添加。没配 `owner.json` 时
 **默认拒绝所有人**，先按快速开始第 2 步用 `bind` 完成绑定。绑定窗口
 只在部署时当场开启、限时 10 分钟——不要无人值守地开着窗口等人来。
+
+## 致谢与参考
+
+拟人化回复的打磨参考了以下项目的思路（只借思路，本仓库没有直接复用
+它们的代码；未采纳的部分也一并注明，免得后人误以为是照搬）：
+
+- [ElmerAlan-an/human_chat_operit](https://github.com/ElmerAlan-an/human_chat_operit) — 短句口语、自检清单、反重复的思路；未采纳其斜杠命令体系与人格扮演设定
+- [oaa529/zhichi](https://github.com/oaa529/zhichi) — 拟真引擎的分条、打字节奏、情绪连续性思路；未采纳故意错别字、说漏嘴撤回等表演项
+- [huihuihenqiang/WeClone-llm](https://github.com/huihuihenqiang/WeClone-llm) — 逐句回复的思路；未采纳按标点硬切并删标点的做法
+- [Napus-BackendDev/GenieAi-ChatBOT](https://github.com/napus-backenddev/genieai-chatbot/blob/HEAD/CLAUDE.md) — 分隔符分气泡 + 按长度停顿的 dispatcher 思路；停顿档位尚未实现，仅作参考
+- [freestylefly/openclaw-wechat](https://deepwiki.com/freestylefly/openclaw-wechat/4.5-reply-dispatcher) — Reply Dispatcher 的分段与发送时序思路
+- [molang163/chinese-natural-reply](https://github.com/molang163/chinese-natural-reply) — 先给结论、说大白话、去防御性套话
+- [speak-human-tw](https://www.typingmind.com/skills/raymondhou0917-speak-human-tw) — 先保事实、再去 AI 味、最后加人味
+- [Treasure-hub-agent/ai-with-u](https://github.com/Treasure-hub-agent/ai-with-u) — 时间差感知：隔夜隔天自然接续
+- [kroxchan/xinyi](https://github.com/kroxchan/xinyi) — 情绪状态机（情绪别跳变、负面消退慢、过渡自然）与真实性自检五维；未采纳其学人/解密聊天记录的整套路线
+
+协议本身来自腾讯官方 iLink / openclaw-weixin 生态。微信解密、桌面自动化、
+聊天记录微调克隆等路线均未采用。
 
 ## License
 

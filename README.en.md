@@ -122,6 +122,16 @@ keeps a stranger from talking their way onto the allowlist.
   (pre-login environment check), `smoke-test` (end-to-end self-check),
   `prune-media` (media retention cleanup), `rotate-chatlog` (monthly
   chatlog archiving); see the cheat sheet below
+- **Human-like replies, polished** — replies read like a human texting:
+  long sentences are broken into short ones, conclusion first, then
+  detail, in plain words with no template phrasing; content that
+  naturally segments goes out as 2–3 short bubbles (a reaction, the
+  substance, a question), never splitting one sentence across bubbles;
+  emotions don't flip abruptly and conversations resume naturally
+  after a gap; each reply gets a self-check on tone, length, word
+  choice, structure, and emotional directness. Complex technical
+  content may keep longer sentences — the short-sentence default never
+  overrides accuracy. See the delivery clause in `AGENTS.md`
 
 ## Markdown rendering in outbound messages
 
@@ -174,7 +184,12 @@ Proactive push: any program ──> ilink.py proactive (cached context_token) �
 ```
 
 Two polling drivers (the hook driver is the production-grade one;
-`daemon.py` is an example driver):
+`daemon.py` is an example driver). Only one may run at a time, and
+this is now enforced by a shared driver lock
+(`ilink-driver.lock` in the hook state dir): the first driver wins
+and the latecomer stays quiet — the daemon refuses to start when
+the hook heartbeat is fresh, and a hook run that cannot take the
+lock exits without polling or waking.
 
 | Driver | Best for | Entry point |
 | --- | --- | --- |
@@ -378,6 +393,26 @@ is only recorded in `data/unknown_senders.json` for manual approval.
 With no `owner.json` at all, **everyone is denied** — complete step 2 of
 the quick start (`bind`) first. The binding window is a setup-time,
 10-minute affair — never leave one open unattended.
+
+## Acknowledgments
+
+The human-like reply polish borrows ideas — not code — from the
+following projects (what was *not* taken is noted too, so nobody
+mistakes this for a copy):
+
+- [ElmerAlan-an/human_chat_operit](https://github.com/ElmerAlan-an/human_chat_operit) — short colloquial sentences, a reply self-checklist, anti-repetition; its slash-command system and persona roleplay were not adopted
+- [oaa529/zhichi](https://github.com/oaa529/zhichi) — a realism engine's message splitting, typing rhythm, and emotional continuity; its deliberate typos and take-backs were not adopted
+- [huihuihenqiang/WeClone-llm](https://github.com/huihuihenqiang/WeClone-llm) — sentence-by-sentence replies; its hard punctuation splitting (which strips punctuation) was not adopted
+- [Napus-BackendDev/GenieAi-ChatBOT](https://github.com/napus-backenddev/genieai-chatbot/blob/HEAD/CLAUDE.md) — separator-based bubble splitting plus length-scaled pauses in its dispatcher; the pause tiers are not implemented yet, reference only
+- [freestylefly/openclaw-wechat](https://deepwiki.com/freestylefly/openclaw-wechat/4.5-reply-dispatcher) — Reply Dispatcher chunking and delivery timing
+- [molang163/chinese-natural-reply](https://github.com/molang163/chinese-natural-reply) — conclusion first, plain language, no defensive hedging
+- [speak-human-tw](https://www.typingmind.com/skills/raymondhou0917-speak-human-tw) — facts first, then de-AI the wording, then add human flavor
+- [Treasure-hub-agent/ai-with-u](https://github.com/Treasure-hub-agent/ai-with-u) — time-gap awareness: resume naturally after a night or days away
+- [kroxchan/xinyi](https://github.com/kroxchan/xinyi) — an emotion state machine (no abrupt emotional flips, negative tones fade slowly, gradual transitions) and a five-dimension authenticity self-check; its learn-a-person / decrypt-chat-history approach was not adopted
+
+The protocol itself comes from Tencent's official iLink / openclaw-weixin
+ecosystem. WeChat decryption, desktop automation, and chat-history
+fine-tuning clones were all deliberately not used.
 
 ## License
 

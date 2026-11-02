@@ -41,6 +41,20 @@ exec 9>"$STATE_DIR/ilink-watch.lock"
 if ! flock -n 9; then
   exit 0
 fi
+# 共享驱动锁（daemon/hook 二选一落到锁上，不只靠文档）：
+# daemon 常驻时会一直持有 $STATE_DIR/ilink-driver.lock；本脚本每轮
+# 尝试非阻塞拿同一把锁，拿不到 = daemon 在跑，本轮安静退出，不
+# touch 心跳、不 poll、不 wake。反过来，daemon 启动时会先看
+# ilink-heartbeat 是否新鲜（本脚本每轮都 touch），新鲜就拒绝启动，
+# 所以先跑起来的驱动赢，后到的安静让路。两把锁分工不同：
+# ilink-watch.lock 防 hook 自己重叠，ilink-driver.lock 防 hook 与
+# daemon 互抢。注意顺序：驱动锁检查必须在 touch 心跳之前，否则
+# 一个被 daemon 挡住的 hook 轮次也会刷新心跳，误导 daemon 以为
+# hook 还活着。
+exec 8>"$STATE_DIR/ilink-driver.lock"
+if ! flock -n 8; then
+  exit 0
+fi
 # 存活心跳：每轮都 touch，看门狗凭它判断 hook 是不是还在跑。
 # 拿不到锁的实例安静退出，不 touch。
 touch "$STATE_DIR/ilink-heartbeat"

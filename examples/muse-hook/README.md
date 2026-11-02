@@ -66,6 +66,9 @@
   轮询故障处理（进程硬崩溃也会进告警状态机，而不是被当成"没有新
   消息"）。
 
+- **共享驱动锁**：本脚本每轮在单实例锁之外，还会非阻塞尝试状态目录下的 `ilink-driver.lock`；拿不到说明 `daemon.py` 在跑，本轮安静退出（不 touch 心跳、不 poll、不 wake）。反过来，`daemon.py` 启动时若本脚本的心跳新鲜也会拒绝启动。先跑起来的驱动赢，后到的让路——“hook 与 daemon 二选一”不再只是一句文档。
+- **两把锁分工不同**：`ilink-watch.lock` 防 hook 自己重叠，`ilink-driver.lock` 防 hook 与 daemon 互抢；两个驱动必须指向同一个状态目录，锁才共享。
+
 脚本里的路径已参数化（`ILINK_DATA_DIR`、`ILINK_HOOK_STATE_DIR`、`ILINK_CLIENT`；
 状态目录旧变量名 `ILINK_HOOK_STATE` 仍兼容，默认值与 `ilink.py health` 一致），
 `$HATCH_HOOK_RUNTIME` 是 Muse hook 运行时提供的环境，非 Muse 环境请用

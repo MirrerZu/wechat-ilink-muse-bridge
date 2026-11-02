@@ -95,6 +95,20 @@ atomic `mv`. When woken, handle the batch under this contract:
   the content naturally segments (a reaction, the substance, a
   question) — like a human texting — but never one reply per incoming
   message, and never split a single sentence across bubbles.
+  Write short sentences first: break a long sentence into several
+  short ones instead of dumping one long compound sentence. Lead with
+  the conclusion, then the detail; plain words, no template phrasing
+  (no "firstly... secondly... finally", no "in summary", no "as an AI
+  assistant"), no canned comfort lines, and don't repeat the previous
+  reply's opening or phrasing. Keep the emotional tone continuous
+  across turns: don't flip from angry to warm in one turn, let
+  negative tones fade slowly, and make transitions gradual. If the
+  conversation resumes after a gap (overnight or days), pick it up
+  naturally instead of acting as if nothing happened. Complex or
+  technical content may keep longer sentences to preserve the logic;
+  the short-sentence default never overrides accuracy. Before sending,
+  self-check tone, length, word choice, structure, and emotional
+  directness — rewrite if any of them feels off.
 - Quote context: an entry may carry `quoted_text` (the original message
   being quoted), `quoted_kind`, `quoted_fragment` (start/end characters
   of a selective quote), and `quoted_media_path` (when the quoted
@@ -204,7 +218,7 @@ for any OpenAI-compatible API (config via `LLM_API_KEY` / `LLM_BASE_URL` /
 `LLM_MODEL` env vars); replace it with your own reply logic when you need
 more (see `daemon.py`).
 
-- **Hook 与 daemon 二选一，不要同跑**：两者都会 poll 并处理同一批消息。同跑时回复多半被发送账本的 key 兜住（不至于重复投递），但会白费算力、双唤醒，还可能让两个驱动互相干扰。生产用 hook 驱动；daemon 只是示例驱动。
+- **Hook 与 daemon 二选一，且由共享驱动锁强制执行**（不只靠文档）：两者都会 poll 并处理同一批消息，锁文件是状态目录下的 `ilink-driver.lock`（与 `ilink.py health` 的状态目录一致，两个驱动必须指向同一个状态目录，锁才共享）。先跑起来的驱动赢，后到的安静让路：daemon 常驻持有该锁，启动时若 hook 心跳（`ilink-heartbeat`，hook 每轮都 touch）新鲜则直接拒绝启动（退出码 2）；hook 每轮尝试非阻塞拿同一把锁，拿不到就安静退出，不 touch 心跳、不 poll、不 wake。生产用 hook 驱动；daemon 只是示例驱动。发送账本的 key 仍是最后一道防线（同跑时多半能兜住重复投递），但锁才是防止双唤醒和白费算力的正门。
 
 ## 3. Verify
 
