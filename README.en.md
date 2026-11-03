@@ -1,7 +1,7 @@
 # wechat-ilink-muse-bridge
 
-[![CI](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/gfydfhcf/wechat-ilink-muse-bridge)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/releases)
+[![CI](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MirrerZu/wechat-ilink-muse-bridge)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
@@ -30,7 +30,7 @@ a standalone `daemon.py`, and the Muse hook setup used in production.
 Send this sentence to your Muse:
 
 ```
-Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/gfydfhcf/wechat-ilink-muse-bridge
+Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/MirrerZu/wechat-ilink-muse-bridge
 ```
 
 It will deploy everything itself by following [`AGENTS.md`](AGENTS.md) in the
@@ -38,8 +38,7 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
 
 After login it will ask you to **send the bot a first message within 10
 minutes** to bind the owner: the first sender becomes the Owner and
-receives a four-part welcome (the fourth asks about subscribing to
-release reminders); if nobody messages in time, it reminds
+receives a three-part welcome; if nobody messages in time, it reminds
 you again and reopens the binding window.
 
 One day-to-day flow worth knowing once deployed: **approving a new
@@ -106,12 +105,6 @@ keeps a stranger from talking their way onto the allowlist.
   (30 days / 10k entries, including the bot's own messages). Messages
   from before the cache existed can't be recovered afterwards — the
   server offers no fetch-by-id endpoint
-- **Subscription update reminders + one-sentence install** —
-  `version-check` queries the upstream latest Release; owners opt in by
-  replying "subscribe", notifications go only to subscribed owners once
-  per version, and replying "install update" installs the new release
-  in the background (verify everything first, then swap, roll back on
-  failure, state files untouched)
 - **Liveness watchdog** — the hook touches a heartbeat every run;
   `ilink.py watchdog` flags staleness after 30 minutes, a 15-minute
   cron reports the first sighting and the recovery, repeat staleness
@@ -214,8 +207,7 @@ python3 ilink.py login <qrcode-id>     # session saved to data/session.json
 
 # 2. Bind the owner (required): open the 10-minute binding window, then
 #    send the bot any message. The first sender becomes the Owner and
-#    gets a four-part welcome confirming the binding (the fourth asks
-#    about subscribing to release reminders); on BIND_TIMEOUT
+#    gets a three-part welcome confirming the binding; on BIND_TIMEOUT
 #    just run the command again to reopen the window.
 python3 ilink.py bind
 
@@ -267,10 +259,6 @@ python3 ilink.py send-video <user_id> <ctx> <video>     # reply with a video
 python3 ilink.py proactive-image <user_id> <image>      # proactively push an image
 python3 ilink.py proactive-file <user_id> <file>        # proactively push a file
 python3 ilink.py proactive-video <user_id> <video>      # proactively push a video
-python3 ilink.py version-check [--notify]              # check upstream latest Release (--notify: subscribed owners only)
-python3 ilink.py subscribe <owner_id>                  # opt in to update reminders
-python3 ilink.py unsubscribe <owner_id>                # opt out of update reminders
-python3 ilink.py update-to <tag> [--hook-dir <dir>]    # install a Release tag (two-phase, rolls back on failure)
 python3 ilink.py rollback [--hook-dir <dir>]           # restore from the newest .bak-* backup
 python3 ilink.py watchdog [--max-age-mins N]           # hook heartbeat watchdog (default 30 minutes)
 python3 ilink.py stats                                 # offline snapshot (no server calls)
@@ -342,24 +330,19 @@ The data directory defaults to `./data/` and can be overridden with the
   occasionally cut long-polling connections; the client must back off and
   reconnect (handled here — `POLL_ERROR` lines in the log are regulars and
   harmless).
-- **Updates: code auto-upgrades, the contract (AGENTS.md) does not**:
-  after subscribing to release reminders, a new release brings a WeChat
-  notification with a summary, and replying "安装更新" installs the new
-  ilink.py and hook scripts in the background (verify everything first,
-  then swap everything, roll back on failure, state files never
-  touched). But AGENTS.md currently cannot auto-upgrade and must be
-  changed manually — whenever a release changes the contract, the
-  updater downloads the new AGENTS.md to AGENTS.md.new in the deployment
-  directory for reference, and the post-update message says so
-  explicitly. Only release tags are installed, never the latest code on
-  main, and never from an arbitrary URL.
+- **Upgrades: no self-update**: release checks, update reminders and
+  one-reply install were removed. Upgrade in place by hand, following
+  section 5 of [`AGENTS.md`](AGENTS.md): swap ilink.py and the hook
+  scripts first (keeping `.bak` backups — `ilink.py rollback` restores
+  them), then the worker prompt in the hook definition (template:
+  `examples/muse-hook/worker-prompt.md`); no re-scan, no re-bind. Only
+  the owner starts it, from the main chat — never a WeChat message.
 - **In-chat slash commands: not implemented**: unlike Telegram, WeChat
   shows no command menu when you type `/` — a slash command is just
   plain text with no discovery entry point. The bot is an LLM, so
   natural language already covers the same intents ("how are you
-  doing?", "forget what I said above"); actions that must execute
-  exactly (subscribe/unsubscribe/install update) use exact keyword
-  matching instead of slashes.
+  doing?", "forget what I said above"); admin actions (approving a
+  sender, upgrading) happen in the main chat only, never over WeChat.
 
 ## Incident log: the night the bot sent "--key"
 

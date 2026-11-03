@@ -10,7 +10,7 @@ gets them merged.
 ## Set up
 
 ```bash
-git clone https://github.com/gfydfhcf/wechat-ilink-muse-bridge
+git clone https://github.com/MirrerZu/wechat-ilink-muse-bridge
 cd wechat-ilink-muse-bridge
 pip install -r requirements.txt     # only hard dependency: cryptography
 export ILINK_DATA_DIR=/tmp/ilink-dev-data

@@ -21,10 +21,7 @@ repairs themselves (M1-M5, L1-L15, S2/S3/S5 as applicable):
 - L9: commit rejects non-list ids / non-string cursor / non-object payload
 - L10: poll normalizes a numeric from_user_id to str before the owner check
 - L11: CLI integer args reject garbage with usage + exit 2, no traceback
-- L12: update-to verifies a published sha256 when present, and warns
-  (without failing) when the AGENTS.md download fails
-- L13: concurrent version-notify runs send each owner exactly once, and
-  no subscribers is a quiet success (0)
+- (L12/L13 covered update-to and version-notify, both removed 2026-11-03)
 - L14: login QR refreshes do not stretch the original deadline
 - L15: cmd_send omits context_token when falsy, like _send_raw
 - S2: the send audit log is chmod 600 after append
@@ -294,49 +291,6 @@ class KeyedProactiveConcurrencyTest(Review29Test):
         self.assertEqual(len(sends), 1)
 
 
-class VersionNotifyConcurrencyTest(Review29Test):
-    def test_concurrent_runs_send_each_owner_once(self):
-        with open(ilink.VERSION_NOTIFY_FILE, "w") as f:
-            json.dump({"subscribed": ["owner-1"], "notified": {}}, f)
-        with open(ilink.CONTACTS_FILE, "w") as f:
-            json.dump({"owner-1": {"context_token": "ctx"}}, f)
-        sends = []
-
-        def fake_proactive(owner, text):
-            time.sleep(0.2)  # force overlap if the lock were missing
-            sends.append(owner)
-            return 0
-
-        with mock.patch.object(ilink, "cmd_proactive",
-                               side_effect=fake_proactive):
-            results = []
-
-            def run():
-                with contextlib.redirect_stdout(io.StringIO()):
-                    results.append(ilink._version_notify_locked(
-                        "v9.9.9", {"body": "notes",
-                                   "html_url": "https://example.invalid/r"}))
-            threads = [threading.Thread(target=run) for _ in range(2)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        self.assertEqual(sorted(results), [0, 0])
-        self.assertEqual(sends, ["owner-1"])
-        with open(ilink.VERSION_NOTIFY_FILE) as f:
-            state = json.load(f)
-        self.assertEqual(state["notified"], {"owner-1": "v9.9.9"})
-
-    def test_no_subscribers_is_quiet_success(self):
-        with open(ilink.VERSION_NOTIFY_FILE, "w") as f:
-            json.dump({"subscribed": [], "notified": {}}, f)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            code = ilink._do_version_notify("v9.9.9", {"body": ""})
-        self.assertEqual(code, 0)
-        self.assertIn("NO_SUBSCRIBERS", buf.getvalue())
-
-
 class CliIntArgsTest(Review29Test):
     def test_illegal_integers_exit_2_with_usage(self):
         cases = [
@@ -352,68 +306,6 @@ class CliIntArgsTest(Review29Test):
             code, _out, err = self._run_main(argv)
             self.assertEqual(code, 2, argv)
             self.assertIn("usage:", err, argv)
-
-
-class UpdateToReviewTest(Review29Test):
-    NEW_ILINK = 'VERSION = "1.3.0"\nprint("new")\n'
-
-    def setUp(self):
-        super().setUp()
-        self._old_version = ilink.VERSION
-        ilink.VERSION = "1.2.0"
-        self.addCleanup(setattr, ilink, "VERSION", self._old_version)
-        self.script = os.path.join(DATA_DIR, "ilink.py")
-        with open(self.script, "w") as f:
-            f.write('VERSION = "1.2.0"\nprint("old")\n')
-
-    def _run_update(self, notes_body, compare_files, agents_content):
-        def fake_json(url):
-            if "compare" in url:
-                return {"files": [{"filename": fn} for fn in compare_files]}
-            if "/releases/tags/" in url:
-                return {"body": notes_body}
-            raise AssertionError(f"unexpected json url: {url}")
-
-        def fake_text(url):
-            if url.endswith("/ilink.py"):
-                return self.NEW_ILINK
-            if url.endswith("/AGENTS.md"):
-                return agents_content
-            raise AssertionError(f"unexpected text url: {url}")
-
-        with mock.patch.object(ilink, "_github_get_json",
-                               side_effect=fake_json), \
-                mock.patch.object(ilink, "_github_get_text",
-                                  side_effect=fake_text):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                code = ilink.cmd_update_to("v1.3.0", script_path=self.script)
-        return code, buf.getvalue()
-
-    def test_hash_mismatch_refuses_and_replaces_nothing(self):
-        code, out = self._run_update(
-            "ilink.py sha256: " + "0" * 64, ["ilink.py"], None)
-        self.assertEqual(code, 1)
-        self.assertIn("UPDATE_FAILED:verify:hash_mismatch", out)
-        with open(self.script) as f:
-            self.assertIn('VERSION = "1.2.0"', f.read())
-
-    def test_hash_match_installs(self):
-        digest = hashlib.sha256(self.NEW_ILINK.encode()).hexdigest()
-        code, out = self._run_update(
-            f"ilink.py sha256: {digest}", ["ilink.py"], None)
-        self.assertEqual(code, 0, out)
-        with open(self.script) as f:
-            self.assertIn('VERSION = "1.3.0"', f.read())
-
-    def test_agents_download_failure_warns_but_updates(self):
-        code, out = self._run_update(
-            "", ["ilink.py", "AGENTS.md"], None)
-        self.assertEqual(code, 0, out)
-        self.assertIn("CONTRACT:AGENTS.md:download-failed", out)
-        self.assertFalse(os.path.exists(os.path.join(DATA_DIR, "AGENTS.md.new")))
-        with open(self.script) as f:
-            self.assertIn('VERSION = "1.3.0"', f.read())
 
 
 class MediaCapTest(Review29Test):

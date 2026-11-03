@@ -19,7 +19,7 @@ WeChat user ──message──> iLink server
                               ▼
                 ilink-pending.json          ← pending queue (atomic writes,
                               │               survives power loss)
-                              │  worker claims with mv → ilink-processing.json
+                              │  worker: ilink.py claim → ilink-processing.json
                               ▼
                       Muse worker agent     ← pre-send queue re-check, merges
                                               bursts, sends exactly one reply;
@@ -33,8 +33,19 @@ WeChat user ──message──> iLink server
 - **No lost messages**: the hook script writes messages to disk *before*
   waking the agent. If the agent crashes or times out, the messages are
   still in the queue and the next script run wakes it again.
-- **No duplicate replies**: claiming is an atomic `mv` — of several
-  overlapping wakes, exactly one gets the queue; the rest exit quietly.
+- **One wake per batch**: a batch is woken once. While a warm worker
+  or an open, unanswered claim exists, no wake goes out at all (that
+  worker merges pending before sending); a batch nobody claimed is
+  re-woken only after `ILINK_REWAKE_SECS` (default 180). The old
+  "wake every round while pending exists" produced ~95 wakes for one
+  batch and backed up wake delivery for over an hour.
+- **No duplicate replies**: the worker claims with `ilink.py claim`
+  (locked, shared with this script through `ilink-queue.lock`): a
+  second worker gets `CLAIM_BUSY` and exits before reading any
+  context. The pre-send re-check is `claim --lease <lease>`, which
+  moves new pending messages INTO the claim, so no one else answers
+  them; `release <lease>` lets go once the reply is sent. Never `mv`:
+  it overwrites another worker's claim.
 - **Burst merging**: when a user fires off several messages, iLink splits
   them into multiple responses. The worker does not wait a fixed interval;
   it does a **pre-send re-check** — after composing a reply, right before
@@ -61,7 +72,10 @@ WeChat user ──message──> iLink server
   then hourly; when an alerted problem recovers, the agent wakes once
   to say it's back (un-alerted blips clear silently); when a worker's
   claim times out and is recycled, the pending wake carries a
-  `stuck_alert` field. Recovery (re-scan / network back) clears the
+  `stuck_alert` field; when the hook itself did not run for
+  `ILINK_GAP_SECS` (default 600), its next run wakes `hook_gap` with
+  the gap length — a cron watchdog that slept through the same outage
+  only ever sees the refreshed heartbeat. Recovery (re-scan / network back) clears the
   expiry marker automatically — the old never-clear behavior would
   have suppressed the *next* expiry notice; fixed.
 - **Delivery semantics: at-least-once.** Polling is two-phase:
@@ -70,10 +84,16 @@ WeChat user ──message──> iLink server
   pending queue first, then calls `ilink.py commit`. A crash anywhere
   means the batch is simply re-fetched next round: a reply may
   duplicate, but a message is never silently lost. Supporting rules:
-  stale-claim recycling only runs while the pending queue is empty
-  (it can never overwrite a newer batch), and empty/invalid poll
-  output is treated as a poll failure (a hard crash enters the alert
-  state machine instead of masquerading as "no new messages").
+  a claim not renewed for 10 minutes is either dropped (its reply is
+  already in the send ledger) or folded back IN FRONT of the pending
+  queue — stray `ilink-processing-*.json` files included — never
+  overwriting a newer batch; a valid empty queue is removed so polling
+  resumes; and empty/invalid poll output or a non-zero business code
+  is a poll failure (it enters the alert state machine instead of
+  masquerading as "no new messages").
+- **Event log**: wakes, claims, merges and releases append to
+  `ilink-events.jsonl` (ids, counts, timings, never text), so one
+  batch can be followed from arrival to release.
 
 Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE_DIR`,
 `ILINK_CLIENT`; the legacy state-dir name `ILINK_HOOK_STATE` still works, and

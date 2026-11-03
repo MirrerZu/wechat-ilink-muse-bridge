@@ -8,6 +8,9 @@ Usage:
   ilink.py bind [seconds]      # one 10-min owner-binding window (first sender wins + welcome)
   ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
   ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
+  ilink.py claim [--lease <l>] # worker: take the pending batch (CLAIM_OK <lease> + JSON / CLAIM_BUSY / CLAIM_EMPTY); with --lease merge new pending into your batch
+  ilink.py renew <lease>       # worker: keep the claim alive (~every 60s while working)
+  ilink.py release <lease>     # worker: let go of the batch once the whole reply is sent
   ilink.py send <to> <ctx> <text> [--key <id>]  # send text reply (use - for stdin)
   ilink.py proactive <to> <text> [--key <id>]   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
@@ -80,6 +83,7 @@ SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -
 SEND_LEDGER_LOCK_FILE = os.path.join(BRIDGE, "send_ledger.lock")  # inter-process lock for keyed sends
 SEND_AUDIT_CAP = 1000  # audit lines kept; older lines are trimmed on write
 SEND_LEDGER_TTL = 86400  # ledger entries older than this are pruned on write
+SEND_RETRY_BACKOFF = (5, 15, 30)  # seconds before each network-error retry of a reply; one client_id throughout
 QUOTE_CACHE_FILE = os.path.join(BRIDGE, "quote_cache.json")  # msg_id -> quoted original {text, kind, from, at, media_path?}; plus svr_id -> msg_id
 QUOTE_CACHE_LOCK_FILE = os.path.join(BRIDGE, "quote_cache.lock")  # inter-process lock for cache read-modify-write
 QUOTE_CACHE_TTL = 30 * 86400  # quoted originals older than this are pruned on write (mirrors official text retention)
@@ -332,90 +336,6 @@ def cmd_prune_media(max_age_days=MEDIA_PRUNE_MAX_AGE_DAYS,
     return 0
 
 
-# --- Version check ----------------------------------------------------------
-# A deployed bridge notifies its own owner when the repo publishes a new
-# release. Release discipline: bump VERSION here BEFORE tagging the
-# release — a forgotten bump makes every deployment report itself
-# outdated forever, since the check compares this constant with the
-# latest release tag.
-VERSION = "1.3.0"
-VERSION_CHECK_URL = ("https://api.github.com/repos/gfydfhcf/"
-                     "wechat-ilink-muse-bridge/releases/latest")
-VERSION_NOTIFY_FILE = os.path.join(BRIDGE, "version_notify.json")
-
-
-def _parse_version(s):
-    """'v1.2.0' -> (1, 2, 0). Unparseable segments become 0; missing
-    parts pad to three, so '1.2' compares equal to '1.2.0'."""
-    s = (s or "").strip().lstrip("vV")
-    parts = []
-    for seg in s.split(".")[:3]:
-        try:
-            parts.append(int(seg))
-        except ValueError:
-            parts.append(0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts)
-
-
-def _compare_versions(a, b):
-    """-1 if a<b, 0 if equal, 1 if a>b (numeric segments only)."""
-    pa, pb = _parse_version(a), _parse_version(b)
-    return (pa > pb) - (pa < pb)
-
-
-def _fetch_latest_release():
-    """Return the latest release dict (tag_name, name, body, html_url),
-    or None on any failure (never raises: a background check must not
-    crash the caller)."""
-    try:
-        req = urllib.request.Request(
-            VERSION_CHECK_URL,
-            headers={"User-Agent": "wechat-ilink-muse-bridge"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _update_notify_text(tag, rel):
-    """Notification text for a new release: version, a short excerpt of
-    the release notes (mechanical truncation to 800 chars, not a
-    curated summary), the release page link, and the install/postpone
-    question."""
-    body = (rel.get("body") or "").strip()
-    excerpt = body[:800]
-    if len(body) > 800:
-        excerpt += "……"
-    lines = [f"微信桥有新版了：{tag}（当前 {VERSION}）。"]
-    if excerpt:
-        lines.append(f"【更新内容】{excerpt}")
-    else:
-        lines.append("【更新内容】（本次无更新说明）")
-    url = rel.get("html_url") or (
-        "https://github.com/gfydfhcf/wechat-ilink-muse-bridge"
-        f"/releases/tag/{tag}")
-    lines.append(f"详情：{url}")
-    lines.append("回「安装更新」我就在后台装好告诉你，回「暂时别了」就先不装。")
-    return "\n".join(lines)
-
-
-def _load_version_notify():
-    """Load version_notify.json: {"subscribed": [owner_ids],
-    "notified": {owner_id: tag}}. Missing or corrupt reads as empty.
-    NOTE: the pre-subscription shape {"last_notified_tag": ...} is
-    deliberately ignored — subscriptions are opt-in from scratch, so
-    every owner gets at most one notice per tag after subscribing."""
-    try:
-        with open(VERSION_NOTIFY_FILE) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
 def _atomic_write(path, writer, mode=0o600):
     """Atomically replace path with writer(f) output.
 
@@ -437,244 +357,15 @@ def _atomic_write(path, writer, mode=0o600):
     os.replace(tmp, path)
 
 
-def _save_version_notify(state):
-    try:
-        _atomic_write(VERSION_NOTIFY_FILE, lambda f: json.dump(state, f))
-    except Exception:
-        pass
-
-
-SUBSCRIBE_ASK_FILE = os.path.join(BRIDGE, "subscribe_ask.json")
-SUBSCRIBE_ASK_TTL = 86400
-
-
-def _write_subscribe_ask(owner_id):
-    """Open the subscribe-question window after the welcome is
-    delivered. Best-effort: a failed write just means the worker has
-    no window to interpret a bare 'yes' against."""
-    try:
-        _save_json_atomic(SUBSCRIBE_ASK_FILE,
-                          {"owner_id": owner_id,
-                           "asked_at": int(time.time())})
-    except Exception:
-        pass
-
-
-def _clear_subscribe_ask():
-    try:
-        os.remove(SUBSCRIBE_ASK_FILE)
-    except OSError:
-        pass
-
-
-def cmd_subscribe(owner_id):
-    """Opt an owner into release reminders. Idempotent, and clears any
-    pending subscribe question (the decision has been made)."""
-    state = _load_version_notify()
-    subscribed = state.get("subscribed") or []
-    if owner_id not in subscribed:
-        subscribed.append(owner_id)
-    state["subscribed"] = subscribed
-    _save_version_notify(state)
-    _clear_subscribe_ask()
-    print(f"SUBSCRIBED:{owner_id}")
-    return 0
-
-
-def cmd_unsubscribe(owner_id):
-    """Opt an owner out of release reminders. Idempotent, and clears
-    any pending subscribe question."""
-    state = _load_version_notify()
-    state["subscribed"] = [o for o in (state.get("subscribed") or [])
-                           if o != owner_id]
-    _save_version_notify(state)
-    _clear_subscribe_ask()
-    print(f"UNSUBSCRIBED:{owner_id}")
-    return 0
-
-
-def cmd_version_check(notify=False):
-    """Compare local VERSION with the upstream latest release tag.
-    Prints UP_TO_DATE, UPDATE_AVAILABLE:<tag>, or
-    VERSION_CHECK_FAILED. With --notify and an update available, sends
-    one proactive notification to each SUBSCRIBED owner who has a
-    cached context_token and was not already notified for this tag.
-    Unsubscribed owners are never notified. A failed send is not
-    recorded, so the next check retries it (an offline bot's notice is
-    deferred, not lost). With --notify, the message also carries a
-    release-notes excerpt and the install question, and a successful
-    send writes an update_offer marker (tag, owners, time) that the
-    worker uses to recognize an affirmative reply as 'install it'."""
-    rel = _fetch_latest_release()
-    tag = (rel or {}).get("tag_name")
-    if not tag:
-        print("VERSION_CHECK_FAILED")
-        return 1
-    if _compare_versions(VERSION, tag) >= 0:
-        print("UP_TO_DATE")
-        return 0
-    print(f"UPDATE_AVAILABLE:{tag}")
-    if not notify:
-        return 0
-    return _version_notify_locked(tag, rel)
-
-
-VERSION_NOTIFY_LOCK_FILE = os.path.join(BRIDGE, "version_notify.lock")
-
-
-def _do_version_notify(tag, rel):
-    """Send one proactive update notice to each subscribed owner not
-    yet notified for this tag. Callers must hold the version-notify
-    lock across this call (see _version_notify_locked): the
-    load → send → save sequence is only once-per-owner-per-tag when
-    two concurrent runs cannot both observe the same pending set."""
-    state = _load_version_notify()
-    subscribed = state.get("subscribed") or []
-    notified = state.get("notified") or {}
-    if not subscribed:
-        print("NO_SUBSCRIBERS")
-        return 0  # nobody to notify: quiet success, not a cron failure
-    pending = [o for o in subscribed if notified.get(o) != tag]
-    if not pending:
-        return 0  # everyone already notified for this tag: quiet success
-    contacts = load_contacts()
-    reachable = [o for o in pending
-                 if (contacts.get(o) or {}).get("context_token")]
-    if not reachable:
-        print("NO_CONTEXT_TOKEN")
-        return 1
-    sent_any = False
-    last_code = 0
-    sent_owners = []
-    text = _update_notify_text(tag, rel)
-    for owner in reachable:
-        code = cmd_proactive(owner, text)
-        if code == 0:
-            notified[owner] = tag
-            sent_any = True
-            sent_owners.append(owner)
-        else:
-            last_code = code
-    state["subscribed"] = subscribed
-    state["notified"] = notified
-    state["checked_at"] = int(time.time())
-    _save_version_notify(state)
-    if sent_any:
-        _write_update_offer(tag, sent_owners)
-    if not sent_any:
-        return last_code or 1
-    return 0
-
-
-def _version_notify_locked(tag, rel):
-    """Run _do_version_notify under an inter-process flock so two
-    concurrent version-check runs cannot double-send. Falls back to
-    unlocked on platforms without fcntl (same policy as the quote
-    cache lock)."""
-    fd = None
-    if fcntl is not None:
-        try:
-            fd = os.open(VERSION_NOTIFY_LOCK_FILE,
-                         os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except Exception:
-            fd = None
-    try:
-        return _do_version_notify(tag, rel)
-    finally:
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
-
-
-UPDATE_OFFER_FILE = os.path.join(BRIDGE, "update_offer.json")
-UPDATE_OFFER_TTL = 86400
-
-
-def _write_update_offer(tag, owners):
-    """Record that these owners were offered this tag, so the worker
-    can recognize a fresh affirmative reply as 'install it'.
-    Best-effort: a failed write just means no recognition window."""
-    try:
-        _save_json_atomic(UPDATE_OFFER_FILE,
-                          {"tag": tag, "owners": list(owners),
-                           "offered_at": int(time.time())})
-    except Exception:
-        pass
-
-
-def _clear_update_offer():
-    try:
-        os.remove(UPDATE_OFFER_FILE)
-    except OSError:
-        pass
-
-
-# --- Self-update --------------------------------------------------------------
-# update-to installs a RELEASE tag (never main, never an arbitrary URL):
-# ilink.py always; hook scripts when --hook-dir names the deployed hook
-# directory and the release changed them; AGENTS.md is NEVER applied
-# automatically — a changed contract is downloaded to
-# BRIDGE/AGENTS.md.new for manual sync, and the post-update message must
-# say so (see the worker contract in AGENTS.md). Two phases: download +
-# verify everything first, then swap everything (backups kept as
-# .bak-<tag>). Any verification failure replaces nothing. State files
-# (session, owner, contacts, ledgers, caches) are never touched.
-UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/gfydfhcf/"
-                   "wechat-ilink-muse-bridge")
-UPDATE_COMPARE_URL = ("https://api.github.com/repos/gfydfhcf/"
-                      "wechat-ilink-muse-bridge/compare")
-UPDATE_RELEASE_URL = ("https://api.github.com/repos/gfydfhcf/"
-                      "wechat-ilink-muse-bridge/releases/tags")
-
-
-def _release_ilink_sha256(head):
-    """Return the ilink.py sha256 published in the release notes for
-    <head>, or None when the notes carry none. The notes are the only
-    channel: the compare API lists changed files but no hashes. Only
-    a line like 'ilink.py sha256: <64 hex>' counts; anything else
-    means 'no hash published' (warn, don't fail)."""
-    rel = _github_get_json(f"{UPDATE_RELEASE_URL}/{head}")
-    body = (rel or {}).get("body") or ""
-    m = re.search(r"ilink\.py\s+sha256:\s*([0-9a-fA-F]{64})", body)
-    if m:
-        return m.group(1).lower()
-    return None
+# --- Hook script files --------------------------------------------------------
+# The deployed hook scripts `rollback --hook-dir` restores next to ilink.py.
+# (Release checks and self-update were removed 2026-11-03: upgrades are
+# done in place by hand, see AGENTS.md section 5.)
 HOOK_SCRIPT_FILES = ("ilink-watch.sh", "ilink-warm-wait.sh")
 # Watchdog default: the hook runs every ~5s, so a heartbeat older than
 # 30 minutes means ~360 missed runs — a near-zero false-positive
 # signal, checked by a 15-minute cron.
 WATCHDOG_MAX_AGE_MINS = 30
-
-
-def _github_get_json(url):
-    """GET a GitHub URL and parse JSON, or None on any failure."""
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "wechat-ilink-muse-bridge"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
-    except Exception:
-        return None
-
-
-def _github_get_text(url):
-    """GET a URL as text, or None on any failure."""
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "wechat-ilink-muse-bridge"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8")
-    except Exception:
-        return None
-
-
-def _extract_version(source):
-    """VERSION = "..." from ilink.py source, or None."""
-    m = re.search(r"^VERSION\s*=\s*\"([^\"]+)\"", source, re.MULTILINE)
-    return m.group(1) if m else None
 
 
 def _verify_python_source(source):
@@ -714,165 +405,6 @@ def _verify_shell_source(source):
 def _copy_file(src, dst):
     with open(src, "rb") as f_in, open(dst, "wb") as f_out:
         f_out.write(f_in.read())
-
-
-def cmd_update_to(tag, hook_dir=None, script_path=None):
-    """Install release <tag>. Prints UPDATE_OK:<tag> plus per-file
-    lines, or UPDATE_FAILED:<reason> (with ROLLED_BACK when a post-swap
-    failure restored the backups). UP_TO_DATE when already on the tag;
-    refuses older tags (never downgrade) and tags with '/' or '..'.
-    script_path defaults to the running script file (tests pass a temp
-    path so the repo file is never touched)."""
-    tag = (tag or "").strip()
-    if not tag or "/" in tag or ".." in tag:
-        print("UPDATE_FAILED:bad_tag")
-        return 1
-    cmp = _compare_versions(VERSION, tag)
-    if cmp >= 0:
-        if cmp == 0:
-            print("UP_TO_DATE")
-            return 0
-        print("UPDATE_FAILED:not_newer")
-        return 1
-    if script_path is None:
-        script_path = os.path.abspath(__file__)
-    head = tag if tag[:1] in ("v", "V") else "v" + tag
-    base = VERSION if VERSION[:1] in ("v", "V") else "v" + VERSION
-    compare = _github_get_json(f"{UPDATE_COMPARE_URL}/{base}...{head}")
-    changed = set()
-    compare_ok = False
-    if isinstance(compare, dict) and isinstance(compare.get("files"), list):
-        compare_ok = True
-        for f in compare["files"]:
-            name = f.get("filename")
-            if name:
-                changed.add(name)
-    # Phase 1: download + verify everything.
-    plan = []  # (kind, target_path, content)
-    src = _github_get_text(f"{UPDATE_RAW_BASE}/{head}/ilink.py")
-    if src is None:
-        print("UPDATE_FAILED:download")
-        return 1
-    err = _verify_python_source(src)
-    if err:
-        print(f"UPDATE_FAILED:verify:ilink.py:{err[:200]}")
-        return 1
-    file_version = _extract_version(src)
-    if file_version is None or _compare_versions(file_version, tag) != 0:
-        # Also enforces release discipline: a tag whose ilink.py was
-        # not bumped to the tag refuses to install.
-        print("UPDATE_FAILED:verify:version_mismatch")
-        return 1
-    published_hash = _release_ilink_sha256(head)
-    if published_hash:
-        import hashlib
-        actual_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
-        if actual_hash != published_hash:
-            print("UPDATE_FAILED:verify:hash_mismatch")
-            return 1
-    else:
-        # Optional check by design: releases that do not publish a
-        # hash install as before, but loudly, so a missing hash can
-        # never pass silently.
-        print(f"WARNING: no ilink.py sha256 in release notes for "
-              f"{head}; installing without hash check",
-              file=sys.stderr, flush=True)
-    plan.append(("ilink.py", script_path, src))
-    script_lines = []
-    if hook_dir and not compare_ok:
-        script_lines.append("SKIPPED:hook-scripts:compare-unavailable")
-    elif hook_dir:
-        for name in HOOK_SCRIPT_FILES:
-            target = os.path.join(hook_dir, name)
-            repo_path = f"examples/muse-hook/{name}"
-            if repo_path not in changed:
-                script_lines.append(f"SKIPPED:{name}:unchanged")
-                continue
-            if not os.path.isfile(target):
-                script_lines.append(f"SKIPPED:{name}:missing")
-                continue
-            content = _github_get_text(
-                f"{UPDATE_RAW_BASE}/{head}/{repo_path}")
-            if content is None:
-                print("UPDATE_FAILED:download")
-                return 1
-            err = _verify_shell_source(content)
-            if err:
-                print(f"UPDATE_FAILED:verify:{name}:{err[:200]}")
-                return 1
-            plan.append((name, target, content))
-    elif compare_ok and any(f"examples/muse-hook/{n}" in changed
-                            for n in HOOK_SCRIPT_FILES):
-        script_lines.append("SKIPPED:hook-scripts:no-hook-dir")
-    contract_line = None
-    if compare_ok and "AGENTS.md" in changed:
-        content = _github_get_text(f"{UPDATE_RAW_BASE}/{head}/AGENTS.md")
-        if content:
-            plan.append(("AGENTS.md.new",
-                         os.path.join(BRIDGE, "AGENTS.md.new"), content))
-            contract_line = "CONTRACT:AGENTS.md.new"
-        else:
-            # Loud but non-fatal: the contract changed but its new
-            # text could not be fetched (a transient failure must not
-            # block an otherwise good update), yet the worker must
-            # not walk away believing the contract is unchanged.
-            print("WARNING: AGENTS.md changed in this release but its "
-                  "download failed; contract NOT updated — sync "
-                  "AGENTS.md manually", file=sys.stderr, flush=True)
-            contract_line = "CONTRACT:AGENTS.md:download-failed"
-    # Phase 2: backup + atomic swap, then re-verify from disk.
-    backed = []  # (target, backup_path or None)
-    try:
-        for kind, target, content in plan:
-            backup = None
-            if os.path.exists(target):
-                backup = target + f".bak-{head}"
-                _copy_file(target, backup)
-            backed.append((target, backup))
-            tmp = target + f".tmp-update-{os.getpid()}"
-            try:
-                mode = os.stat(target).st_mode & 0o777
-            except OSError:
-                mode = 0o644
-            with open(tmp, "w") as f:
-                f.write(content)
-            os.chmod(tmp, mode)
-            os.replace(tmp, target)
-        with open(script_path) as f:
-            err = _verify_python_source(f.read())
-        if err:
-            raise RuntimeError(f"post-verify ilink.py: {err}")
-        for kind, target, content in plan:
-            if kind in HOOK_SCRIPT_FILES:
-                with open(target) as f:
-                    err = _verify_shell_source(f.read())
-                if err:
-                    raise RuntimeError(f"post-verify {kind}: {err}")
-    except Exception as e:
-        for target, backup in backed:
-            try:
-                if backup:
-                    os.replace(backup, target)
-                else:
-                    os.remove(target)
-            except OSError:
-                pass
-        print(f"UPDATE_FAILED:swap:{e}")
-        print("ROLLED_BACK")
-        return 1
-    _clear_update_offer()
-    print(f"UPDATE_OK:{head}")
-    for kind, target, content in plan:
-        if kind == "AGENTS.md.new":
-            continue
-        print(f"UPDATED:{kind}")
-    for line in script_lines:
-        print(line)
-    if contract_line:
-        print(contract_line)
-    if not compare_ok:
-        print("COMPARE:unavailable")
-    return 0
 
 
 def load_contacts():
@@ -1143,7 +675,7 @@ def note_unknown_sender(from_id):
 # poll stays deny-by-default forever. After QR login the deployer runs
 # `ilink.py bind`, which opens ONE bounded window (default 600s). The first
 # account to message the bot inside that window becomes the owner and gets
-# the four-part welcome below. If the window lapses, bind exits with
+# the three-part welcome below. If the window lapses, bind exits with
 # BIND_TIMEOUT (exit 3) so the deploying agent can remind the human and run
 # bind again — an unattended, indefinitely open "first come wins" mode
 # would let a stranger seize a bridge whose owner file was lost.
@@ -1152,7 +684,6 @@ WELCOME_MESSAGES = [
     "欢迎使用 WeChat iLink Muse Bridge！",
     "绑定成功，当前微信账号已设为 Owner。今后只有 Owner 以及你手动批准的账号可以与我聊天。",
     "现在可以直接给我发送消息了。",
-    "顺便问一句：要不要订阅本项目的更新提醒？有新版时我会在微信上告诉你。回复「订阅」就开通，随时回「取消订阅」就能关。",
 ]
 
 
@@ -1323,12 +854,6 @@ def _deliver_pending_welcome(token):
         s["cursor"] = commit["cursor"]
         save_session(s)
     mark_seen(commit.get("ids") or [])
-    # The welcome is fully delivered: open the 24h subscribe-question
-    # window. The worker interprets an affirmative owner reply inside
-    # the window as opting in (see the worker contract in AGENTS.md);
-    # the marker is inert after expiry and is cleared by any
-    # subscribe/unsubscribe decision.
-    _write_subscribe_ask(owner_id)
     clear_bind_state()
     print(f"BIND_OK:{owner_id}")
     return 0
@@ -1693,8 +1218,14 @@ def cmd_poll():
         return 1
     if data.get("code") == -14:
         return _report_token_status()
-    if data.get("code", 0) == 0:
-        _clear_token_stale()
+    code = data.get("code") or 0
+    if code != 0:
+        # Any other business error is a failed poll, not an empty one:
+        # printing an empty batch here used to read as "no new messages"
+        # to the hook, so the poll_failing alert could never fire.
+        print(f"POLL_ERROR:code={code} {str(data.get('errmsg', ''))[:120]}")
+        return 1
+    _clear_token_stale()
     new_buf = data.get("get_updates_buf") or buf
     fresh, new_ids = filter_seen(data.get("msgs") or [])
     owners = load_owner_ids()
@@ -1762,6 +1293,11 @@ def cmd_poll():
             kind = ITEM_TYPE_NAMES.get(t, f"unknown_{t}")
             entry = {"from_user_id": from_id, "context_token": ctx, "kind": kind,
                      "message_id": m.get("message_id")}
+            # The sender's own send time (ms). Local receive time is not
+            # a substitute: it hides every delay before this poll.
+            sent_ms = m.get("create_time_ms") or item.get("create_time_ms")
+            if sent_ms:
+                entry["create_time_ms"] = sent_ms
             if t == 1:  # TEXT
                 entry["text"] = (item.get("text_item") or {}).get("text", "")
                 if entry["text"]:
@@ -2326,7 +1862,10 @@ def cmd_proactive(to_user_id, text, key=None):
 
 @_keyed_send_locked
 def cmd_send(to_user_id, context_token, text, key=None):
-    """发送回复。网络层失败时用相同 client_id 最多重试一次；应用层明确失败不重试。
+    """发送回复。网络层失败时用相同 client_id 按 SEND_RETRY_BACKOFF 退避重试
+    （默认 3 次，共约 50 秒）；应用层明确失败不重试。2026-11-02 18:03 那条
+    回复就是断连两次、5 秒内放弃而丢的——同一 client_id 服务端会去重，
+    多等一会儿再试不会重复投递。
     key 不为空时：账本已有该 key 的成功记录直接返回已发送，不再调用 API；
     否则先落意图（含固定 client_id）再发送，成功后标记已发送——重试复用
     同一 client_id，服务端去重兜底，崩溃窗口也不重复投递。"""
@@ -2382,15 +1921,16 @@ def cmd_send(to_user_id, context_token, text, key=None):
         # L15: align with _send_raw, which only sends a truthy
         # context_token; a null key used to be sent unconditionally.
         body["msg"]["context_token"] = context_token
-    for attempt in (1, 2):
+    attempts = len(SEND_RETRY_BACKOFF) + 1
+    for attempt in range(1, attempts + 1):
         try:
             t0 = time.time()
             data = api("POST", "ilink/bot/sendmessage", body, token=token, timeout=40)
         except Exception as e:
             _audit_send("send", to_user_id, client_id, "exception",
                         error=type(e).__name__, attempt=attempt)
-            if attempt == 1:
-                time.sleep(5)
+            if attempt < attempts:
+                time.sleep(SEND_RETRY_BACKOFF[attempt - 1])
                 continue
             print(f"SEND_ERROR:{e}")
             return 1
@@ -2826,6 +2366,9 @@ def _queue_count(path):
     return len(data["msgs"]), False
 
 
+HEALTH_PENDING_WARN_SECS = 300  # a batch unclaimed this long is backlog, not a queue
+
+
 def cmd_health(offline=False):
     """Self-check: auth, live token probe, message queue, last poll error.
     Exit code 0 = healthy, 1 = warnings, 2 = broken."""
@@ -2884,9 +2427,29 @@ def cmd_health(offline=False):
             f"pending queue is corrupt (unparseable JSON): {pend} — "
             "the hook quarantines it on its next run; inspect it there")
     elif pend_n > 0:
-        lines.append(f"queue: {pend_n} message(s) pending")
+        try:
+            waiting = now - int(os.stat(pend).st_mtime)
+        except OSError:
+            waiting = 0
+        if waiting > HEALTH_PENDING_WARN_SECS:
+            # A count alone said "OK" for a batch nobody had claimed in
+            # two hours: age is what tells backlog from a normal queue.
+            warnings.append(
+                f"{pend_n} message(s) pending for {_fmt_age(waiting)} with no "
+                "claim (no worker is picking them up)")
+        else:
+            lines.append(f"queue: {pend_n} message(s) pending")
     else:
         lines.append("queue: nothing pending")
+    try:
+        orphans = sorted(n for n in os.listdir(state_dir)
+                         if n.startswith("ilink-processing-") and n.endswith(".json"))
+    except OSError:
+        orphans = []
+    if orphans:
+        warnings.append(
+            f"stray claim file(s) {', '.join(orphans)} — not a valid claim "
+            "slot; the hook folds them back into pending once 10m stale")
     if os.path.exists(proc):
         claimed_age = now - int(os.stat(proc).st_ctime)  # ctime = claim time
         if claimed_age > 600:
@@ -3177,6 +2740,309 @@ def cmd_watchdog(max_age_mins=WATCHDOG_MAX_AGE_MINS):
     return 0
 
 
+# --- Batch claim protocol (2026-11-03) ---------------------------------------
+# Workers used to claim with a bare `mv pending processing`. Production showed
+# three holes in that: a second worker's mv silently overwrote the first
+# worker's claim; a warm worker still holding its answered batch had no legal
+# slot for the next one and improvised ilink-processing-2.json, which nothing
+# ever recovered; and nothing said when to let go, so an answered batch aged
+# past 10 minutes and was recycled into a fresh wake. claim / renew / release
+# make each step one locked command. The lease stored in the processing file
+# is the holder's proof: a worker whose lease no longer matches was taken
+# over and must stop.
+CLAIM_STALE_SECS = 600  # same 10 minutes as the hook's `-cmin +10` recycle
+CLAIM_EVENTS_CAP = 2000  # ilink-events.jsonl lines kept
+
+
+def _claim_paths():
+    d = _hook_state_dir()
+    return (d, os.path.join(d, "ilink-pending.json"),
+            os.path.join(d, "ilink-processing.json"))
+
+
+@contextlib.contextmanager
+def _queue_lock():
+    """Serialize claim/renew/release with each other and with the hook's
+    own queue edits (the hook flocks the same ilink-queue.lock). Same
+    platform rule as the send ledger lock: no fcntl, no lock."""
+    d = _hook_state_dir()
+    os.makedirs(d, exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(os.path.join(d, "ilink-queue.lock"),
+                 os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _load_claim_file(path):
+    """(data, corrupt) for a queue or claim file; (None, False) when it
+    does not exist. Same strict shape rule as _queue_count."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, False
+    except Exception:
+        return None, True
+    if not isinstance(data, dict) or not isinstance(data.get("msgs"), list):
+        return None, True
+    return data, False
+
+
+def _claim_age(path, now):
+    """Seconds since the claim was taken or last renewed. ctime, like the
+    hook's -cmin test: rename and touch both refresh it. None if gone."""
+    try:
+        return now - int(os.stat(path).st_ctime)
+    except OSError:
+        return None
+
+
+def _unlink(path):
+    """Remove a queue file that may already be gone: a pre-claim worker
+    still mv's without the lock, so absence is never an error here."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _quarantine(path, now):
+    try:
+        os.replace(path, f"{path}.corrupt-{now}-{os.getpid()}")
+    except OSError:
+        pass
+
+
+def _batch_answered(msgs):
+    """True when this batch's reply is on record. Workers key the reply
+    with the batch's first message_id (bubbles add -1, -2, ...), so a
+    sent entry under that key means the batch is done and was only
+    never released. A corrupt ledger reads as not answered: re-checking
+    a batch costs one worker turn, dropping it on a guess loses it."""
+    if not msgs:
+        return True
+    mid = msgs[0].get("message_id")
+    if mid is None:
+        return False
+    try:
+        book = _load_send_ledger()
+    except LedgerCorrupt:
+        return False
+    return any(_ledger_entry_is_sent(book.get(k))
+               for k in (str(mid), f"{mid}-1"))
+
+
+def _merge_msgs(*lists):
+    """Concatenate queues in order, dropping exact duplicate entries (a
+    batch can come back through recovery and a re-poll at once)."""
+    seen, out = set(), []
+    for lst in lists:
+        for m in lst:
+            sig = json.dumps(m, sort_keys=True, ensure_ascii=False)
+            if sig not in seen:
+                seen.add(sig)
+                out.append(m)
+    return out
+
+
+def _oldest_wait_secs(msgs, now):
+    """Seconds since the oldest message in the batch was SENT (its
+    create_time_ms), or None when no entry carries one."""
+    sent = [m.get("create_time_ms") for m in msgs
+            if isinstance(m.get("create_time_ms"), (int, float))
+            and m.get("create_time_ms") > 0]
+    if not sent:
+        return None
+    return max(0, int(now - min(sent) / 1000))
+
+
+def _claim_event(event, **fields):
+    """Append one line to ilink-events.jsonl in the hook state dir. The
+    hook writes its wakes there too, so one file shows the whole life of
+    a batch: arrival -> wake -> claim -> merge -> release. Ids, counts
+    and timings only, never message text. Never raises."""
+    try:
+        path = os.path.join(_hook_state_dir(), "ilink-events.jsonl")
+        entry = {"ts": int(time.time()), "event": event, "source": "claim"}
+        entry.update({k: v for k, v in fields.items() if v is not None})
+        with open(path, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if os.path.getsize(path) > CLAIM_EVENTS_CAP * 400:
+            with open(path) as f:
+                lines = f.readlines()
+            _atomic_write(path, lambda f: f.writelines(lines[-CLAIM_EVENTS_CAP:]))
+    except Exception:
+        pass
+
+
+def _print_batch(status, data, now, **extra):
+    msgs = data["msgs"]
+    view = {"lease": data.get("lease"), "count": len(msgs),
+            "first_message_id": msgs[0].get("message_id") if msgs else None,
+            "oldest_wait_secs": _oldest_wait_secs(msgs, now)}
+    view.update(extra)
+    view["msgs"] = msgs
+    print(status)
+    print(json.dumps(view, ensure_ascii=False))
+
+
+def cmd_claim(lease=None):
+    """Take the pending batch, or with lease merge newly pending messages
+    into the batch you already hold (the pre-send re-check).
+
+    Without lease:
+      CLAIM_BUSY <age>  someone holds a live, unanswered claim: exit the
+                        turn now, before reading any memory
+      CLAIM_EMPTY       nothing to do
+      CLAIM_OK <lease>  then one JSON line: lease, count,
+                        first_message_id (the send key), oldest_wait_secs,
+                        took_over, msgs
+    A claim that is already answered (see _batch_answered) is dropped, not
+    honored. One that has not been renewed for CLAIM_STALE_SECS is taken
+    over: its messages, and those of any stale ilink-processing-*.json a
+    pre-claim worker improvised, go first in the new batch, so the send
+    key stays that of the original batch.
+
+    With lease:
+      CLAIM_MERGED <n>  then the full batch JSON; n new messages were
+                        moved out of pending into your claim
+      CLAIM_LOST        your claim was taken over: do not send, end the
+                        turn (exit 1)"""
+    state_dir, pend, proc = _claim_paths()
+    now = int(time.time())
+    with _queue_lock():
+        pend_data, pend_bad = _load_claim_file(pend)
+        pend_msgs = pend_data["msgs"] if pend_data else []
+        proc_data, proc_bad = _load_claim_file(proc)
+        if lease:
+            if not proc_data or proc_data.get("lease") != lease:
+                _claim_event("lost", lease=lease)
+                print("CLAIM_LOST")
+                return 1
+            before = len(proc_data["msgs"])
+            proc_data["msgs"] = _merge_msgs(proc_data["msgs"], pend_msgs)
+            proc_data["renewed_at"] = now
+            _atomic_write(proc, lambda f: json.dump(proc_data, f, ensure_ascii=False))
+            if pend_data is not None:
+                _unlink(pend)
+            added = len(proc_data["msgs"]) - before
+            _claim_event("merge", lease=lease, added=added,
+                         count=len(proc_data["msgs"]))
+            _print_batch(f"CLAIM_MERGED {added}", proc_data, now)
+            return 0
+
+        took_over = []
+        carried = []
+        if proc_bad:
+            _quarantine(proc, now)
+            _claim_event("quarantine", file=os.path.basename(proc))
+        elif proc_data is not None:
+            age = _claim_age(proc, now)
+            if _batch_answered(proc_data["msgs"]):
+                _claim_event("drop_answered", lease=proc_data.get("lease"),
+                             file=os.path.basename(proc))
+            elif age is not None and age < CLAIM_STALE_SECS:
+                _claim_event("busy", holder=proc_data.get("lease"), age=age)
+                print(f"CLAIM_BUSY {age}")
+                return 0
+            else:
+                carried.append(proc_data["msgs"])
+                took_over.append(os.path.basename(proc))
+        orphans = []
+        for name in sorted(os.listdir(state_dir)):
+            if not (name.startswith("ilink-processing-") and name.endswith(".json")):
+                continue
+            path = os.path.join(state_dir, name)
+            age = _claim_age(path, now)
+            if age is None or age < CLAIM_STALE_SECS:
+                continue  # a pre-claim worker may still be on it
+            data, bad = _load_claim_file(path)
+            if bad:
+                _quarantine(path, now)
+                _claim_event("quarantine", file=name)
+                continue
+            orphans.append(path)
+            if not _batch_answered(data["msgs"]):
+                carried.append(data["msgs"])
+                took_over.append(name)
+        msgs = _merge_msgs(*carried, pend_msgs)
+        if not msgs:
+            for path in orphans:
+                _unlink(path)
+            if proc_data is not None:
+                _unlink(proc)
+            print("CLAIM_EMPTY")
+            return 0
+        new = {"lease": f"{random.randint(0, 0xFFFFFFFF):08x}",
+               "claimed_at": now, "renewed_at": now, "msgs": msgs}
+        # Write the claim first, then drop its sources: a crash in
+        # between leaves a duplicate (re-checked against the ledger),
+        # never a loss.
+        _atomic_write(proc, lambda f: json.dump(new, f, ensure_ascii=False))
+        if pend_data is not None:
+            _unlink(pend)
+        for path in orphans:
+            _unlink(path)
+        wait = _oldest_wait_secs(msgs, now)
+        _claim_event("claim", lease=new["lease"], count=len(msgs),
+                     oldest_wait_secs=wait, took_over=took_over or None)
+        _print_batch(f"CLAIM_OK {new['lease']}", new, now,
+                     took_over=took_over)
+        return 0
+
+
+def cmd_renew(lease):
+    """Keep a live claim from being recycled: run about every 60 seconds
+    while working, and around any long read or generation. RENEW_OK, or
+    CLAIM_LOST (exit 1) when the claim was taken over — stop, do not
+    send."""
+    _, _, proc = _claim_paths()
+    with _queue_lock():
+        data, _ = _load_claim_file(proc)
+        if not data or data.get("lease") != lease:
+            _claim_event("lost", lease=lease)
+            print("CLAIM_LOST")
+            return 1
+        os.utime(proc)
+    print("RENEW_OK")
+    return 0
+
+
+def cmd_release(lease):
+    """Let go of a batch once every bubble of its reply is sent, BEFORE
+    the warm wait. RELEASE_OK; RELEASE_GONE when there is no claim left
+    (released already); CLAIM_LOST (exit 1) when someone else holds it
+    now — leave their claim alone."""
+    _, _, proc = _claim_paths()
+    now = int(time.time())
+    with _queue_lock():
+        data, _ = _load_claim_file(proc)
+        if data is None and not os.path.exists(proc):
+            print("RELEASE_GONE")
+            return 0
+        if not data or data.get("lease") != lease:
+            _claim_event("lost", lease=lease)
+            print("CLAIM_LOST")
+            return 1
+        _unlink(proc)
+    held = None
+    if isinstance(data.get("claimed_at"), int):
+        held = now - data["claimed_at"]
+    _claim_event("release", lease=lease, count=len(data["msgs"]),
+                 held_secs=held)
+    print("RELEASE_OK")
+    return 0
+
+
 def cmd_rotate_chatlog():
     """Archive chatlog.md lines from past months into per-month files
     (chatlog-YYYY-MM.md), keeping current-month and undated lines in
@@ -3225,9 +3091,9 @@ def cmd_rotate_chatlog():
 
 
 def _newest_backup(target):
-    """Newest '<target>.bak-*' file by mtime, or None. Covers both
-    backup schemes: update-to's '.bak-<tag>' and the port script's
-    '.bak-<date>-<label>'. Pre-rollback copies ('.bak-pre-rollback-*')
+    """Newest '<target>.bak-*' file by mtime, or None. Covers every
+    backup scheme: the old update-to's '.bak-<tag>' and the manual
+    upgrade's '.bak-<date>-<label>' (AGENTS.md section 5). Pre-rollback copies ('.bak-pre-rollback-*')
     are valid sources too — rolling back twice returns to the state
     before the first rollback."""
     d = os.path.dirname(target) or "."
@@ -3245,13 +3111,13 @@ def _newest_backup(target):
 
 def cmd_rollback(hook_dir=None, script_path=None):
     """Restore ilink.py (and, with --hook-dir, the hook scripts) from
-    the newest .bak-* backup next to each file — the backups update-to
-    and the port script leave behind. All-or-nothing: every target
+    the newest .bak-* backup next to each file — the backups a manual
+    upgrade leaves behind (AGENTS.md section 5). All-or-nothing: every target
     must have a backup and every backup must verify (compile check
     for ilink.py, bash -n for hook scripts) before anything is
     swapped. Current files are first copied to
     '.bak-pre-rollback-<epoch>' so a rollback is itself reversible.
-    State files are never touched (same rule as update-to), and the
+    State files are never touched, and the
     worker contract (AGENTS.md) is not rolled back — it is manual
     anyway. After swapping, the restored script's health --offline
     runs best-effort and its verdict is reported (HEALTH:<verdict>)
@@ -3541,6 +3407,24 @@ def main(argv):
                     return 2
                 age = parsed
         return cmd_watchdog(age)
+    if cmd == "claim":
+        lease = None
+        args = argv[2:]
+        if "--lease" in args:
+            i = args.index("--lease")
+            if i + 1 >= len(args):
+                print("usage: ilink.py claim [--lease <lease>]", file=sys.stderr)
+                return 2
+            lease = args[i + 1]
+        return cmd_claim(lease)
+    if cmd == "renew":
+        if not _need(argv, 3, "ilink.py renew <lease>"):
+            return 2
+        return cmd_renew(argv[2])
+    if cmd == "release":
+        if not _need(argv, 3, "ilink.py release <lease>"):
+            return 2
+        return cmd_release(argv[2])
     if cmd == "rotate-chatlog":
         return cmd_rotate_chatlog()
     if cmd == "rollback":
@@ -3573,25 +3457,6 @@ def main(argv):
                     return 2
                 total_mb = parsed
         return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
-    if cmd == "version-check":
-        return cmd_version_check(notify="--notify" in argv)
-    if cmd == "update-to":
-        if not _need(argv, 3, "ilink.py update-to <tag> [--hook-dir <dir>]"):
-            return 2
-        hook_dir = None
-        args = argv[3:]
-        for i, a in enumerate(args):
-            if a == "--hook-dir" and i + 1 < len(args):
-                hook_dir = args[i + 1]
-        return cmd_update_to(argv[2], hook_dir=hook_dir)
-    if cmd == "subscribe":
-        if not _need(argv, 3, "ilink.py subscribe <owner_id>"):
-            return 2
-        return cmd_subscribe(argv[2])
-    if cmd == "unsubscribe":
-        if not _need(argv, 3, "ilink.py unsubscribe <owner_id>"):
-            return 2
-        return cmd_unsubscribe(argv[2])
     if cmd == "send":
         if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>]"):
             return 2

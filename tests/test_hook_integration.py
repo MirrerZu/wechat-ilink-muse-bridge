@@ -10,9 +10,11 @@ ilink.py, pinning the two-phase poll contract end to end:
   * a failing commit leaves the queue intact (never lost, never
     overwritten — the batch will simply be re-fetched next round)
   * stale-claim recycling never overwrites a non-empty pending queue
+    (it folds the stale batch in front of it)
   * a hard crash (empty poll output) is a poll failure, not silence
   * a corrupt pending queue is quarantined (PENDING_CORRUPT), never
-    silently treated as empty; a valid empty one stays quiet
+    silently treated as empty; a valid empty one is removed and the
+    round polls as usual
   * a second instance cannot run while the state-dir lock is held
   * a failed commit persists in the commit ledger and is retried at
     the START of the next round, before any new poll — the batch is
@@ -175,6 +177,9 @@ class HookIntegrationTest(unittest.TestCase):
             self.assertIn("COMMIT_FAILED", f.read())
 
     def test_recycling_never_overwrites_pending(self):
+        # A stale, unanswered claim is folded in FRONT of the queued
+        # batch (2026-11-03). It used to be deferred while pending was
+        # non-empty — and the next worker's `mv` then overwrote it.
         proc = os.path.join(self.state, "ilink-processing.json")
         with open(proc, "w") as f:
             json.dump({"msgs": [{"message_id": 1}]}, f)
@@ -183,8 +188,9 @@ class HookIntegrationTest(unittest.TestCase):
         with open(pend_path, "w") as f:
             json.dump({"msgs": [{"message_id": 2}]}, f)
         self.run_hook(EMPTY)
-        self.assertEqual(self.pending(), {"msgs": [{"message_id": 2}]})
-        self.assertTrue(os.path.exists(proc))  # deferred, not moved
+        self.assertEqual(self.pending(),
+                         {"msgs": [{"message_id": 1}, {"message_id": 2}]})
+        self.assertFalse(os.path.exists(proc))
 
     def test_crash_output_is_a_poll_failure(self):
         self.run_hook("")
@@ -272,14 +278,16 @@ class HookIntegrationTest(unittest.TestCase):
             # The round carries on polling normally afterwards.
             self.assertIn('COMMIT {"cursor":"B9","ids":[]}', calls)
 
-    def test_valid_empty_pending_is_quiet(self):
+    def test_valid_empty_pending_is_removed_and_poll_resumes(self):
+        # A valid empty queue used to be "left untouched" — and kept the
+        # script in the pending branch forever, never polling again.
         pend_path = os.path.join(self.state, "ilink-pending.json")
         with open(pend_path, "w") as f:
             json.dump({"msgs": []}, f)
-        calls = self.run_hook()
-        self.assertIn("pending file empty", calls)
+        calls = self.run_hook(BATCH)
         self.assertNotIn("PENDING_CORRUPT", calls)
-        self.assertTrue(os.path.exists(pend_path))  # left untouched
+        self.assertIn('COMMIT {"cursor":"B2","ids":["7"]}', calls)
+        self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
 
     def test_lock_excludes_second_instance(self):
         # Hold the state-dir lock the way a running instance does: a

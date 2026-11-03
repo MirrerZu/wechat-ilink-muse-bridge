@@ -1,7 +1,7 @@
 # wechat-ilink-muse-bridge
 
-[![CI](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/gfydfhcf/wechat-ilink-muse-bridge)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/releases)
+[![CI](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MirrerZu/wechat-ilink-muse-bridge)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
@@ -27,14 +27,14 @@
 把这句话发给你的 Muse：
 
 ```
-帮我用 wechat-ilink-muse-bridge 把微信接入你：https://github.com/gfydfhcf/wechat-ilink-muse-bridge
+帮我用 wechat-ilink-muse-bridge 把微信接入你：https://github.com/MirrerZu/wechat-ilink-muse-bridge
 ```
 
 它会按仓库根目录的 [`AGENTS.md`](AGENTS.md) 自己完成部署，你只需要
 在扫码那一步拿出微信扫一下。
 
 登录后它还会请你在 **10 分钟内给机器人发第一条消息**完成主人绑定：
-第一个发信的账号即成为 Owner，并会收到四条欢迎消息（含一条订阅更新提醒的提问）；超时没发，
+第一个发信的账号即成为 Owner，并会收到三条欢迎消息；超时没发，
 它会再次提醒你并重开绑定窗口。
 
 部署完成后还有一个日常流程值得知道：**添加新发信人**。名单外的人
@@ -82,9 +82,6 @@ Muse 的主聊天里说一句"把待批名单里的加进白名单"，它会把�
   （文字、文件都行）：poll 保留服务端下发的引用关系，本地缓存 id→原文
   30 天/1 万条，机器人自发消息也进缓存；缓存建立之前的旧消息无法事后
   补（服务端没有按 id 取原文的接口）
-- **订阅更新提醒 + 一句话安装** — `version-check` 查上游最新 Release；
-  主人回“订阅”即开通，通知只发已订阅主人、每版本一次；回“安装更新”
-  即在后台装新版（先全部校验、再全部替换，失败回滚，状态文件不碰）
 - **存活看门狗** — hook 每轮 touch 心跳，`ilink.py watchdog` 判 30 分钟
   过期，15 分钟 cron 首报 + 恢复报、重复过期静默；桥有意停用时 touch
   维护标记即可静音
@@ -167,7 +164,7 @@ python3 ilink.py qrcode
 python3 ilink.py login <qrcode-id>     # 登录态存入 data/session.json
 
 # 2. 绑定主人（必需）：开启 10 分钟绑定窗口，然后给机器人发一条任意消息。
-#    第一个发信的账号即成为 Owner，机器人会连发四条欢迎消息确认绑定（含一条订阅更新提醒的提问）；
+#    第一个发信的账号即成为 Owner，机器人会连发三条欢迎消息确认绑定；
 #    超时没人发消息会输出 BIND_TIMEOUT，再次运行本命令重开窗口即可。
 python3 ilink.py bind
 
@@ -212,10 +209,6 @@ python3 ilink.py send-video <user_id> <ctx> <视频路径>   # 回复一个视�
 python3 ilink.py proactive-image <user_id> <图片路径>    # 主动推送图片
 python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文件
 python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视频
-python3 ilink.py version-check [--notify]              # 查上游最新 Release（--notify 只发已订阅主人）
-python3 ilink.py subscribe <owner_id>                  # 开通更新提醒
-python3 ilink.py unsubscribe <owner_id>                # 取消更新提醒
-python3 ilink.py update-to <tag> [--hook-dir <dir>]    # 装指定 Release（两阶段、失败回滚）
 python3 ilink.py rollback [--hook-dir <dir>]           # 从最新 .bak-* 备份恢复
 python3 ilink.py watchdog [--max-age-mins N]           # hook 心跳看门狗（默认 30 分钟）
 python3 ilink.py stats                                 # 本地快照（不调服务端）
@@ -269,19 +262,17 @@ python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
   谁说有谁就是在用逆向协议（有封号风险）。
 - **出口网络要稳**：长轮询连接会被跨国链路偶发切断，客户端需退避重连
   （本仓库已处理，日志里 `POLL_ERROR` 是常客，不影响使用）。
-- **更新：代码可自动升，契约（AGENTS.md）不行**：订阅更新提醒后，
-  有新版时机器人会在微信里发通知并附更新摘要，回“安装更新”即可在
-  后台把 ilink.py 和 hook 脚本换成新版（先全部校验、再全部替换，
-  失败回滚，状态文件一律不碰）。但 AGENTS.md 目前无法实现自动升级，
-  需要手动去改——凡是改了契约的版本，更新程序会把新版 AGENTS.md
-  下载到部署目录的 AGENTS.md.new 备查，对照改一下定义才能生效；
-  更新完的消息里也会写明这一点。只装 Release tag，不装 main 的
-  最新代码，也不认任意链接。
+- **升级：没有自动更新**：版本检查、更新提醒和一键安装都已移除。
+  升级按 [`AGENTS.md`](AGENTS.md) 第 5 节原地手动做：先换 ilink.py
+  和 hook 脚本（留 `.bak` 备份，出问题 `ilink.py rollback`），再换
+  hook 定义里的 worker 指令（模板在
+  `examples/muse-hook/worker-prompt.md`），不重新扫码、不重新绑定。
+  只由主人在主聊天里发起，微信消息不能触发。
 - **微信内斜杠命令：不做**：微信不像 Telegram，输入 / 不会弹出
   命令菜单，斜杠命令发出去只是普通文字、没有发现入口；分身是
   LLM，自然语言已覆盖同类意图（“状态怎么样”“忘掉上面说的”
-  直接说就行）；必须精确执行的动作（订阅/取消订阅/安装更新）
-  用精确关键词匹配实现，不走斜杠。
+  直接说就行）；批准新发信人、升级这类管理操作只在主聊天里做，
+  不走微信。
 
 ## 事故手记：分身有天半夜发了句 --key
 

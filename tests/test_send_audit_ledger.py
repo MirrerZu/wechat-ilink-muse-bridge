@@ -92,7 +92,9 @@ class AuditTest(unittest.TestCase):
         self.assertIn("SEND_FAILED", out)
         self.assertEqual(_audit_lines()[0]["result"], "app_error")
 
-    def test_send_exception_audited_both_attempts(self):
+    def test_send_exception_audited_every_attempt(self):
+        # Network errors retry with backoff (SEND_RETRY_BACKOFF, one
+        # client_id throughout); every attempt leaves an audit row.
         with mock.patch.object(ilink, "api",
                                side_effect=RuntimeError("boom")), \
                 mock.patch.object(time, "sleep"):
@@ -100,10 +102,13 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("SEND_ERROR", out)
         lines = _audit_lines()
-        self.assertEqual(len(lines), 2)
+        attempts = len(ilink.SEND_RETRY_BACKOFF) + 1
+        self.assertEqual(len(lines), attempts)
         self.assertTrue(all(e["result"] == "exception" for e in lines))
         self.assertTrue(all(e["error"] == "RuntimeError" for e in lines))
-        self.assertEqual([e["attempt"] for e in lines], [1, 2])
+        self.assertEqual([e["attempt"] for e in lines],
+                         list(range(1, attempts + 1)))
+        self.assertEqual(len({e["client_id"] for e in lines}), 1)
 
     def test_proactive_retry_audited(self):
         calls = {"n": 0}
