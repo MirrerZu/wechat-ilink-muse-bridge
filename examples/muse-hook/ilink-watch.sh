@@ -253,7 +253,10 @@ light_typing() {
   owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
   sender=$(jq -r '.msgs[0].from_user_id // empty' "$1" 2>/dev/null || true)
   if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
-    (timeout 45 python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 &) || true
+    # 关掉锁 fd 再放进后台：flock 跟着打开的文件走，typing 进程带着
+    # 9/8 活多久，watch 锁和驱动锁就被占多久，下一轮拿不到锁、整轮
+    # 跳过——生产上每批消息之后都丢一轮（2026-11-03，约 10 秒）。
+    (timeout 45 python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 7>&- 8>&- 9>&- &) || true
   fi
 }
 

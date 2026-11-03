@@ -76,9 +76,12 @@ setup), read `examples/muse-hook/README.md` first, then set the hook up:
 
 1. Copy `examples/muse-hook/ilink-watch.sh` and `ilink-warm-wait.sh`
    into a scripts dir (e.g. `~/hooks/scripts/`) and `chmod +x` both.
-2. Register `ilink-watch.sh` as a hook that runs every ~5–10 seconds,
+2. Register `ilink-watch.sh` as a hook that runs every 5 seconds,
    with `ILINK_DATA_DIR` (the step 0 data dir) and `ILINK_CLIENT` (the
-   absolute path of `ilink.py`) set in its environment. Both are
+   absolute path of `ilink.py`) set in its environment. The runtime
+   never overlaps rounds, so the interval only matters after a round
+   that returned early because a message arrived: a longer one leaves
+   a quick follow-up waiting for the next tick. Both env values are
    required: the script's own fallbacks (`~/wechat-ilink-data`, and
    `ilink.py` inside it) do not match `ilink.py`'s `./data/`. The state
    dir defaults to `~/hooks/state`; if you change it with
@@ -406,8 +409,9 @@ Steps:
    of `examples/muse-hook/worker-prompt.md`, paths filled in. Code
    first, prompt second: a new prompt on old code calls options
    (`claim --recent`, `send --lease`) that do not exist.
-6. Resume: re-enable the hook with its interval unchanged. After its
-   first round, remove `ilink-watchdog-off`.
+6. Resume: re-enable the hook. Its interval is 5 seconds (step 2 of
+   "2. Choose a driver"); set it if the deployment had another. After
+   its first round, remove `ilink-watchdog-off`.
 7. Verify end to end: ask the owner for one WeChat message, then read
    `ilink-events.jsonl` in the hook state dir — expect one `arrive`,
    one `wake`, one `claim` (note its `oldest_wait_secs`), one `merge`

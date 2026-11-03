@@ -45,6 +45,7 @@ Usage:
   most the first text — the deduped retry never re-delivers.
 """
 import base64
+import concurrent.futures
 import contextlib
 import functools
 import inspect
@@ -239,6 +240,53 @@ def download_media_item(item: dict, item_type: int):
     with open(path, "wb") as f:
         f.write(plaintext)
     os.chmod(path, 0o600)
+    return path
+
+
+MEDIA_FETCH_WORKERS = 4
+
+
+def _prefetch_media(fresh, owners):
+    """Download a round's owner media in parallel, before poll's loop.
+    Measured 2026-11-03: four 90-130 KB photos took 9 s one after the
+    other (~2 s each, mostly per-request CDN latency), all of it before
+    the batch reached the queue. Picks the items exactly as the loop
+    does (owner messages only, never a stranger's or the bot's echo) and
+    returns {id(item): (path, error)}. A single item is left to the loop,
+    which downloads it inline as before."""
+    jobs = []
+    for m in fresh:
+        if m.get("message_type") != 1:
+            continue
+        from_id = m.get("from_user_id")
+        if from_id is None or str(from_id) not in owners:
+            continue
+        for item in m.get("item_list") or []:
+            t = item.get("type") or 0
+            if t in (2, 3, 4, 5):
+                jobs.append((item, t))
+    if len(jobs) < 2:
+        return {}
+
+    def fetch(job):
+        try:
+            return download_media_item(*job), None
+        except Exception as e:
+            return None, e
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(MEDIA_FETCH_WORKERS, len(jobs))) as pool:
+        results = list(pool.map(fetch, jobs))
+    return {id(job[0]): r for job, r in zip(jobs, results)}
+
+
+def _fetched_media(fetched, item, item_type):
+    """download_media_item's result for item: prefetched, else now."""
+    if id(item) not in fetched:
+        return download_media_item(item, item_type)
+    path, err = fetched[id(item)]
+    if err is not None:
+        raise err
     return path
 
 
@@ -1229,6 +1277,7 @@ def cmd_poll():
     new_buf = data.get("get_updates_buf") or buf
     fresh, new_ids = filter_seen(data.get("msgs") or [])
     owners = load_owner_ids()
+    fetched = _prefetch_media(fresh, owners)
     filtered_senders = []
     msgs = []
     contacts = load_contacts()
@@ -1314,7 +1363,7 @@ def cmd_poll():
                     cache_parts.append(entry["text"])
                     cache_kinds.append("voice")
                 try:
-                    p = download_media_item(item, t)
+                    p = _fetched_media(fetched, item, t)
                     if p:
                         entry["media_path"] = p
                         cache_media_path = p
@@ -1326,7 +1375,7 @@ def cmd_poll():
                 cache_parts.append(_quote_media_descriptor(t, item))
                 cache_kinds.append(ITEM_TYPE_NAMES.get(t, "text"))
                 try:
-                    p = download_media_item(item, t)
+                    p = _fetched_media(fetched, item, t)
                     if p:
                         entry["media_path"] = p
                         cache_media_path = p

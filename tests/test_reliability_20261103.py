@@ -23,12 +23,16 @@ Hook (examples/muse-hook/ilink-watch.sh, against a fake ilink.py):
     returns and carries poll_secs and, given a send time, lag_secs
   * a warm marker raised by release keeps a follow-up with that
     worker; one past its session cap does not
+  * the background typing child does not take the round locks with
+    it, so the round after a batch is not skipped
   * ilink-hook.env next to the script sets the deployment's paths
     (for hook definitions without an environment field)
 
 ilink.py:
   * poll: a non -14 business error is POLL_ERROR, not an empty batch
   * poll: create_time_ms reaches the queue entry
+  * poll: a round's owner media download in parallel, strangers' and
+    the bot echo's never
   * claim / renew / release: busy, merge, takeover, lost, stray files;
     release raises the warm marker, continuing the session's `since`
   * send: network errors retry with backoff on one client_id
@@ -317,6 +321,15 @@ class HookWakeTest(unittest.TestCase):
         calls = self.run_hook(BATCH)
         self.assertEqual(len(self.wakes(calls)), 1, calls)
 
+    def test_background_typing_does_not_hold_the_round_lock(self):
+        # Production 2026-11-03: the typing child inherited the lock fds,
+        # so the round right after every batch found the watch lock
+        # taken and was skipped (~10 s, just when a follow-up is likely).
+        calls = self.run_hook(BATCH, extra_env={"FAKE_TYPING_DELAY": "2"})
+        self.assertEqual(len(self.wakes(calls)), 1, calls)
+        calls = self.run_hook(EMPTY, extra_env={"FAKE_TYPING_DELAY": "2"})
+        self.assertIn("waiting for a claim", calls)
+
     def test_env_file_next_to_the_script_sets_the_paths(self):
         # A hook definition with no environment field: the deployment's
         # paths live in ilink-hook.env beside the script, which an
@@ -410,6 +423,64 @@ class PollTest(IlinkBase):
         msgs = json.loads(out[0])["msgs"]
         self.assertEqual([m["create_time_ms"] for m in msgs],
                          [1762130379000, 1762130380000])
+
+
+    @staticmethod
+    def _image(tag):
+        return {"type": 2, "image_item": {"tag": tag}}
+
+    def test_media_downloads_run_in_parallel(self):
+        # Production 2026-11-03: four photos downloaded one after the
+        # other held the batch back 9 s before it reached the queue.
+        raw = {"code": 0, "get_updates_buf": "C1", "msgs": [
+            {"message_type": 1, "message_id": 20 + i,
+             "from_user_id": "owner1", "context_token": "ctx",
+             "item_list": [self._image(f"p{i}")]} for i in range(4)]}
+
+        def slow(item, t):
+            time.sleep(0.5)
+            return f"/m/{item['image_item']['tag']}.jpg"
+
+        with mock.patch.object(ilink, "api", return_value=raw), \
+                mock.patch.object(ilink, "download_media_item",
+                                  side_effect=slow):
+            t0 = time.monotonic()
+            code, out = self.run_cmd(ilink.cmd_poll)
+            took = time.monotonic() - t0
+        self.assertEqual(code, 0)
+        msgs = json.loads(out[0])["msgs"]
+        self.assertEqual([m["media_path"] for m in msgs],
+                         [f"/m/p{i}.jpg" for i in range(4)])
+        self.assertLess(took, 1.5)  # one after the other: 2 s
+
+    def test_prefetch_only_fetches_owner_media(self):
+        raw = {"code": 0, "get_updates_buf": "C1", "msgs": [
+            {"message_type": 1, "message_id": 30, "from_user_id": "owner1",
+             "context_token": "ctx",
+             "item_list": [self._image("a"), self._image("b")]},
+            {"message_type": 1, "message_id": 31, "from_user_id": "stranger",
+             "context_token": "ctx2", "item_list": [self._image("s")]},
+            {"message_type": 2, "message_id": 32, "from_user_id": "bot",
+             "item_list": [self._image("e")]}]}
+        fetched = []
+
+        def fetch(item, t):
+            tag = item["image_item"]["tag"]
+            fetched.append(tag)
+            if tag == "b":
+                raise ConnectionError("cdn reset")
+            return f"/m/{tag}.jpg"
+
+        with mock.patch.object(ilink, "api", return_value=raw), \
+                mock.patch.object(ilink, "download_media_item",
+                                  side_effect=fetch), \
+                mock.patch.object(ilink, "note_unknown_sender"):
+            code, out = self.run_cmd(ilink.cmd_poll)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(fetched), ["a", "b"])
+        msgs = json.loads(out[0])["msgs"]
+        self.assertEqual(msgs[0]["media_path"], "/m/a.jpg")
+        self.assertEqual(msgs[1]["media_error"], "cdn reset")
 
 
 class ClaimTest(IlinkBase):
