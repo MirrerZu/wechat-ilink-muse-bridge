@@ -11,11 +11,28 @@ forked from, goes straight to step 5 and never re-runs steps 0–1.5.
 
 ## 0. Prerequisites
 
-- Python 3.10+ and `pip install -r requirements.txt` (the only hard
-  dependency is `cryptography`, used for the encrypted media CDN).
+- Python 3.10+, with the dependencies in a venv at `<bridge dir>/venv`
+  (`<bridge dir>` holds `ilink.py`; the worker prompt expects exactly
+  this path). The only hard dependency is `cryptography`, used for the
+  encrypted media CDN. System Pythons often lack it, and many refuse a
+  system-wide `pip install`:
+
+  ```bash
+  cd <bridge dir>
+  python3 -m venv venv
+  venv/bin/pip install -r requirements.txt
+  export PATH="$PWD/venv/bin:$PATH"   # every python3 below is the venv's
+  ```
+
+  If `python3 -m venv` fails (on Debian/Ubuntu it needs the
+  `python3-venv` package; the error names the exact one), tell the user
+  instead of installing into the system Python. The hook does not inherit your shell: step 2 puts the
+  venv on its PATH.
 - A WeChat account the user can scan a QR code with.
 - Pick a data directory and export it for every command below:
-  `ILINK_DATA_DIR=<dir>` (default `./data/`).
+  `ILINK_DATA_DIR=<dir>` (default `data/` next to `ilink.py`).
+- Check all of it before step 1: `python3 ilink.py preflight` (Python,
+  `cryptography`, network, writable dirs) must exit 0.
 
 ## 1. Log in (human scans once)
 
