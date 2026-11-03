@@ -1,383 +1,174 @@
 # wechat-ilink-muse-bridge
 
 [![CI](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/MirrerZu/wechat-ilink-muse-bridge)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
 [中文](README.md) | [English](README.en.md)
 
-**Bring Muse (Meta's personal AI assistant) into WeChat.**
+**Connect Muse to WeChat.**
 
-Built on Tencent's official iLink / ClawBot protocol (`ilinkai.weixin.qq.com`).
-After a one-time QR-code authorization, your Muse can chat with you inside
-WeChat in real time: you message, it replies in seconds — and it can also
-push you proactive notifications (deliveries, server alerts, reminders...),
-giving you a dual channel of app + WeChat.
+## About
 
-The core client `ilink.py` is framework-free — lift it out on its own and you
-have a minimal iLink client. The repo also ships two long-polling drivers:
-a standalone `daemon.py`, and the Muse hook setup used in production.
+Built on Tencent's official iLink protocol (`ilinkai.weixin.qq.com`). After a QR
+scan, you message the bot in WeChat and a Muse worker picks it up and replies;
+Muse can also push to you on its own. Text, images, files and video go both
+ways, voice inbound only; only allowlisted owners can wake it.
 
-<p align="center">
-  <img src="docs/demo-chat-1.jpg" alt="Real usage: daily chat and video sending" width="300">
-  <img src="docs/demo-chat-2.jpg" alt="Real usage: class push and daily digest" width="300">
-  <br><em>Real usage screenshots: daily pushes, everyday chat, video sending (sensitive details redacted)</em>
-</p>
-
-## Quick deploy inside Muse
-
-Send this sentence to your Muse:
+The production driver is a Muse hook (`examples/muse-hook/`):
 
 ```
-Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/MirrerZu/wechat-ilink-muse-bridge
+WeChat ──> iLink server ──long poll──> ilink-watch.sh (Muse hook, every 5 s)
+                                           │ batch queued in ilink-pending.json
+                                           ▼
+                                   wake worker ──> ilink.py claim
+                                           │       batch + last 24 h + today's diary
+                                           ▼
+                                   ilink.py send --lease ──> WeChat
+                                           │       merges anything new before sending
+                                           ▼
+                                   release ──> ilink-warm-wait.sh waits for a follow-up
 ```
 
-It will deploy everything itself by following [`AGENTS.md`](AGENTS.md) in the
-repo root — you only need to pick up WeChat once, at the QR-scan step.
+`ilink.py` is a framework-free iLink client: send and receive, queue claims,
+media encryption, self-checks. This repository is a fork of the upstream
+wechat-ilink-muse-bridge; since 2026-11-03 its reliability and reply latency
+have been reworked against production data.
 
-After login it will ask you to **send the bot a first message within 10
-minutes** to bind the owner: the first sender becomes the Owner and
-receives a three-part welcome; if nobody messages in time, it reminds
-you again and reopens the binding window.
+## What changed
 
-One day-to-day flow worth knowing once deployed: **approving a new
-sender**. A message from someone outside the allowlist (say, your own
-second WeChat account) is ignored, but the sender's id is recorded in
-`data/unknown_senders.json` — the approval queue. To let them in, just
-say so in your main chat with Muse: it lists the pending ids with
-their sighting counts for your confirmation, then adds the approved one
-to `owner.json`, effective from the next poll. Approvals can only come
-from the main chat, never from inside a WeChat conversation — that lock
-keeps a stranger from talking their way onto the allowlist.
+### One worker per batch
 
-## Features
+- The hook wakes a batch once. No wake while a warm worker or an open claim
+  exists; a batch nobody claimed is re-woken only after 180 seconds.
+- Claims go through `ilink.py claim / renew / release`, locked and leased,
+  instead of a bare `mv`. A duplicate worker gets `CLAIM_BUSY` and exits; a
+  claim not renewed for 10 minutes is taken over, and one already answered is
+  dropped instead of waking a worker to check it.
+- Sends carry an idempotency key (the batch's first `message_id`), so one key
+  never sends twice; network errors retry with backoff under one `client_id`.
+- Self-update is gone. Upgrades are done in place by hand, per
+  [`AGENTS.md`](AGENTS.md) section 5, with backups and rollback.
 
-- **Official protocol, QR-code login** — no reverse engineering, no
-  personal-account hacks; everything runs over Tencent's official iLink channel
-- **Real-time long polling** — the server holds each `getupdates` request for
-  up to 35s and returns the instant a message arrives, so latency is seconds
-  (every project in this space does long polling; this repo's parameters and
-  backoff strategy are copy-ready)
-- **Rapid-fire message merging** — when a user fires off several messages,
-  iLink splits them into multiple responses. This repo does a **pre-send
-  re-check**: after composing a reply but before actually sending it, it
-  glances at the queue once more; anything new gets merged in and answered
-  in context — one reply per burst. **None of the SDKs we surveyed do this**;
-  bots that answer message-by-message feel mechanical and reply to stale
-  context
-- **Send images, files & videos** — `getuploadurl` → AES-128-ECB encryption → CDN
-  upload → `sendmessage` with a media item. Images, files and videos are
-  supported, in reply mode and proactive mode. The protocol has traps
-  (two enum/encoding mismatches); they are documented in code comments
-- **"Typing…" indicator** — lights up while a reply is being composed
-  (`getconfig` for a `typing_ticket` + `sendtyping` to toggle it, ticket
-  cached for 9 minutes), so the user can see the bot is alive
-- **Proactive push** — undocumented, but `sendmessage` with a cached
-  `context_token` can message the user first (with a no-token fallback
-  retry if the cached token is stale)
-- **Resumable media downloads** — images/files arrive via an encrypted CDN;
-  interrupted downloads resume with HTTP Range + exponential-backoff retries
-  (on a weak network, restarting a whole image often dies at 90%)
-- **No duplicate sends** — a failed send is never blindly retried (the server
-  occasionally accepts a message but drops the receipt; a blind retry means
-  the user gets two copies)
-- **Inbound dedupe** — the server occasionally redelivers the same message;
-  poll filters by `message_id` (last 500 persisted to disk), so one message
-  never gets two replies
-- **Owner allowlist** — only senders listed in `owner.json` can wake the
-  bot (enforced in code; several accounts of the same human are fine).
-  Anyone else is dropped at poll time — never queued, never waking the
-  agent — and their id lands in an approval queue for manual review.
-  With no allowlist configured, everyone is denied by default
-- **Closed-loop alerting** — bad news *and* good news: token expiry is
-  reported once, then hourly; poll failures alert only after 10 continuous
-  minutes (no crying wolf over jitter); recovery gets announced; a worker
-  stuck for 10+ minutes has its queue recycled and flagged
-- **health self-check** — `ilink.py health` shows login age, a live token
-  probe, queue backlog and the last poll error in one command, with
-  exit codes 0/1/2 for monitoring
-- **Token expiry nags once** — on expiry a marker file is written and the
-  user is asked to re-scan exactly once
-- **Quoted-message restoration** — when you quote a message and ask about
-  it in WeChat, the bot sees the quoted original (text or file): poll
-  keeps the server's quote reference and a local id-to-original cache
-  (30 days / 10k entries, including the bot's own messages). Messages
-  from before the cache existed can't be recovered afterwards — the
-  server offers no fetch-by-id endpoint
-- **Liveness watchdog** — the hook touches a heartbeat every run;
-  `ilink.py watchdog` flags staleness after 30 minutes, a 15-minute
-  cron reports the first sighting and the recovery, repeat staleness
-  stays silent; a maintenance flag silences it while the bridge is
-  intentionally stopped
-- **Ops commands** — `rollback` (restore from the newest .bak-*
-  backup), `stats` (offline snapshot, no server calls), `preflight`
-  (pre-login environment check), `smoke-test` (end-to-end self-check),
-  `prune-media` (media retention cleanup); see the cheat sheet below
-- **Human-like replies, polished** — replies read like a human texting:
-  long sentences are broken into short ones, conclusion first, then
-  detail, in plain words with no template phrasing; content that
-  naturally segments goes out as 2–3 short bubbles (a reaction, the
-  substance, a question), never splitting one sentence across bubbles;
-  emotions don't flip abruptly and conversations resume naturally
-  after a gap; each reply gets a self-check on tone, length, word
-  choice, structure, and emotional directness. Complex technical
-  content may keep longer sentences — the short-sentence default never
-  overrides accuracy. See the delivery clause in `AGENTS.md`
+### Fewer model rounds
 
-## Markdown rendering in outbound messages
+- `claim --recent --with <today's diary>`: a cold worker gets the batch, both
+  sides' messages from the last 24 hours verbatim and the tail of today's
+  diary in one call, instead of reading memory over several rounds.
+- `send --lease`: the pre-send re-check runs inside the send. If something new
+  arrived, nothing is sent; it prints `SEND_DEFERRED` and the merged batch, and
+  the worker rewrites against the newest context.
+- `ilink-warm-wait.sh` claims a follow-up for the waiting worker and hands it
+  over with the batch.
+- `send --lease` and `release` raise the warm marker, so a follow-up landing
+  while the worker writes its diary no longer wakes a second, cold worker.
 
-Text messages the bot sends are rendered as Markdown by the WeChat
-client — no need to convert to plain text first (verified in three
-rounds of live tests on the Android WeChat client, 2026-10-25):
+### Faster pickup
 
-Renders: multi-level headings, bold, italic (`*...*` and `_..._` both
-work, `***...***` is bold italic), inline code, code blocks (with a
-language label, a copy button and syntax highlighting), unordered /
-ordered / nested lists, links, tables, strikethrough, blockquotes,
-horizontal rules.
+- A round's images and files download in parallel (up to 4 at a time).
+- The background "typing…" child no longer holds the hook's locks; the round
+  after every batch used to be skipped.
+- A round with a queued batch that needs no wake still polls, and new messages
+  are appended under the queue lock. Messages sent while the worker composed
+  used to wait on the server until it finished.
+- The hook runs every 5 seconds.
 
-Does not render: task lists (degrade to bullets with literal `[ ]` /
-`[x]`), image syntax (only the alt text survives, no image — use
-`send-image` / `proactive-image` to send pictures), formulas (the `$`
-delimiters are stripped and the content shows as-is, not as math).
+### Deployment and observability
 
-Italic is hard to notice in Chinese text; it was confirmed with English.
-Results above are from the Android WeChat client — other clients /
-versions may differ.
+- The hook scripts first read `ilink-hook.env` next to themselves, so runtimes
+  whose hook definition has no environment field (a venv python, say) install
+  the new scripts unchanged; upgrades never replace the file.
+- `ilink-events.jsonl` records each batch's arrival, wake, claim, merge and
+  release (ids, counts and times, never text). Arrivals carry `poll_secs` and
+  `lag_secs`; `ilink.py stats` sums up today's pickup lag and claim wait.
 
-## How it differs from similar projects
+## Results
 
-There are already plenty of iLink projects on GitHub: SDKs
-([corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot),
-[epiral/weixin-bot](https://github.com/epiral/weixin-bot)) meant to be used
-as libraries, and Claude Code bridges
-([crazynomad/weixin-claude-bot](https://github.com/crazynomad/weixin-claude-bot))
-that turn WeChat into a remote control for a coding tool.
+Measured in production on 2026-11-03:
 
-This repo connects **Muse the personal assistant itself** — an assistant with
-long-term memory, goals and reminders that reports back proactively — not a
-coding CLI or a bare LLM API. So the focus is not library design, but **the
-pitfalls a real assistant hits when it lives on WeChat**: burst merging,
-duplicate-send prevention, nag-once token expiry, and an at-least-once
-queue that may redeliver but never silently loses a message. Steal away.
+| Metric | Before | After |
+|---|---|---|
+| Wakes | 236 wakes in a day, one batch woken ~95 times; 30 of 34 worker turns re-checked finished work | 1 per batch, never a second worker |
+| Cold reply (arrival → first bubble) | ~36 s per worker turn (bridge tools 0.4 s; the rest 3–9 s model rounds) | 16 s |
+| Follow-up while the worker waits | — | 13 s |
+| Several photos reaching the queue | 4 photos, downloaded one by one: 9 s | 10 photos (2.4 MB) in parallel: 4.3 s |
+| Messages sent while the worker composes | a text arrived 17 s late and forced one more rewrite | 0–9 s |
+| Pickup lag / claim wait (median) | — | 0 s / 1 s |
 
-## Architecture
+Open items (the first model round of a cold start varies; a photo burst gets
+one draft before the rewrite) are tracked in
+[`docs/latency-followups.md`](docs/latency-followups.md) (Chinese).
+
+## Usage
+
+### Fresh install
+
+Send this to your Muse:
 
 ```
-WeChat ──> iLink server ──getupdates long poll──> ilink.py poll
-                                                       │ new messages to disk
-                                                       ▼
-                                               pending queue ──> assistant/worker
-                                                       │ merge bursts, compose reply
-                                                       ▼
-                                               ilink.py send ──> WeChat
-Proactive push: any program ──> ilink.py proactive (cached context_token) ──> WeChat
+Use wechat-ilink-muse-bridge to connect WeChat to yourself: https://github.com/MirrerZu/wechat-ilink-muse-bridge
 ```
 
-Two polling drivers (the hook driver is the production-grade one;
-`daemon.py` is an example driver). Only one may run at a time, and
-this is now enforced by a shared driver lock
-(`ilink-driver.lock` in the hook state dir): the first driver wins
-and the latecomer stays quiet — the daemon refuses to start when
-the hook heartbeat is fresh, and a hook run that cannot take the
-lock exits without polling or waking.
+It deploys itself by following [`AGENTS.md`](AGENTS.md). You do two things:
 
-| Driver | Best for | Entry point |
-| --- | --- | --- |
-| Standalone daemon (example) | any server / VPS | `daemon.py` |
-| Muse hook | the Muse runtime (used in production) | `examples/muse-hook/` |
+1. Scan the QR code it shows you with WeChat.
+2. When it asks, **send the bot any message within 10 minutes** to bind
+   yourself as owner. The first sender becomes the Owner and gets a
+   three-part welcome; if nobody writes in time, it reminds you and opens a
+   new window.
 
-> Note: `daemon.py` is an **example driver**, written to show the protocol
-> and the smallest runnable loop. It commits only after handling, so a
-> crash or a handler exception mid-burst re-delivers the batch
-> (at-least-once; duplicates possible) — it does not promise
-> production-grade delivery. For that (durable on-disk queue, crash
-> recovery, closed-loop alerting), use the hook driver.
+### Upgrading an existing deployment
 
-## Quick start
+In Muse's **main chat**, say:
+
+```
+Upgrade the WeChat bridge in place to the latest main, following section 5 of AGENTS.md in https://github.com/MirrerZu/wechat-ilink-muse-bridge.
+```
+
+No re-scan and no re-bind; the data dir (login, owner, send history) stays as
+it is. A bridge installed from the upstream repo upgrades the same way. Only
+the main chat can start an upgrade, never a WeChat message.
+
+### Day to day
+
+- **Chat**: just message the bot. A burst of messages gets one reply; quote a
+  message and ask about it, and it sees the quoted original.
+- **Proactive push**: `python3 ilink.py proactive <user_id> -`, text on stdin.
+- **Approving a new sender**: messages from senders outside the allowlist (your
+  second WeChat account, say) are ignored and their ids land in
+  `data/unknown_senders.json`. To let one in, tell Muse in the main chat to add
+  the pending senders to the allowlist; it lists them for you to confirm.
+  Only the main chat counts, never anything said in WeChat.
+- **Re-scanning**: when the login expires, Muse tells you once, then hourly
+  until you scan again.
+- **When something seems off**: have Muse run `ilink.py health` first.
+
+### Command cheat sheet
 
 ```bash
-pip install -r requirements.txt
-
-# 1. QR login (prints a QR image path; scan it with WeChat)
-python3 ilink.py qrcode
-python3 ilink.py login <qrcode-id>     # session saved to data/session.json
-
-# 2. Bind the owner (required): open the 10-minute binding window, then
-#    send the bot any message. The first sender becomes the Owner and
-#    gets a three-part welcome confirming the binding; on BIND_TIMEOUT
-#    just run the command again to reopen the window.
-python3 ilink.py bind
-
-# 3. Start long polling (--echo is a demo handler: parrots everything back)
-python3 daemon.py --echo
-
-# Now send the bot a couple of WeChat messages in a row —
-# you'll get a single merged reply
+python3 ilink.py health [--offline]       # self-check: login, queue, last poll (exit 0/1/2)
+python3 ilink.py stats                    # local snapshot: today's arrivals, pickup lag, claim wait, sends
+python3 ilink.py smoke-test [--no-send]   # end-to-end check; sends the owner a test text and image
+python3 ilink.py watchdog                 # hook heartbeat watchdog (cron every 15 minutes)
+python3 ilink.py proactive <user_id> -    # push text
+python3 ilink.py proactive-image <user_id> <image>    # push an image
+python3 ilink.py rollback [--hook-dir <dir>]          # restore from the newest .bak-* backups
+python3 ilink.py prune-media              # media cleanup (default: keep 30 days, 500 MB)
+python3 ilink.py preflight                # pre-login environment check
 ```
 
-To have an LLM write the replies (any OpenAI-compatible API: OpenAI,
-DeepSeek, Qwen, Moonshot, a local Ollama, ...), use `--llm` mode instead —
-configuration is all environment variables:
+The data dir defaults to `./data/`; set `ILINK_DATA_DIR` to change it. Run
+`python3 ilink.py` for every command.
 
-```bash
-LLM_API_KEY=sk-... python3 daemon.py --llm
-# optional: LLM_BASE_URL (default https://api.openai.com/v1),
-#           LLM_MODEL (default gpt-4o-mini), LLM_SYSTEM_PROMPT
-```
+### Notes
 
-`--llm` is an example handler: per-user context of the last 10 messages,
-stdlib only. For an agent setup with tools and long-term memory, see
-`examples/muse-hook/`.
-
-Docker works too — this route is mainly for **self-hosting on your own
-VPS / NAS**: run the standalone `daemon.py` on a server around the clock,
-independent of a Muse environment. (Deploying inside Muse uses the
-AGENTS.md route above — no Docker needed, and Muse sandboxes usually
-don't have Docker anyway.) Session and media persist in the `./data` volume:
-
-```bash
-docker compose run --rm bot python3 ilink.py qrcode        # QR login, once
-docker compose run --rm bot python3 ilink.py login <qrcode-id>
-docker compose run --rm bot python3 ilink.py bind          # message the bot within 10 min to bind the owner
-docker compose up -d                                       # --echo by default
-```
-
-Command cheat sheet:
-
-```bash
-python3 ilink.py bind                                   # bind the owner (10-min window, first sender wins)
-python3 ilink.py poll                                   # fetch one round of new messages (JSON)
-python3 ilink.py send <user_id> <context_token> -       # reply (body via stdin)
-python3 ilink.py proactive <user_id> -                  # proactive push (body via stdin)
-python3 ilink.py typing <user_id> <start|stop>          # show/cancel "typing…"
-python3 ilink.py send-image <user_id> <ctx> <image>     # reply with an image
-python3 ilink.py send-file <user_id> <ctx> <file>       # reply with a file
-python3 ilink.py send-video <user_id> <ctx> <video>     # reply with a video
-python3 ilink.py proactive-image <user_id> <image>      # proactively push an image
-python3 ilink.py proactive-file <user_id> <file>        # proactively push a file
-python3 ilink.py proactive-video <user_id> <video>      # proactively push a video
-python3 ilink.py rollback [--hook-dir <dir>]           # restore from the newest .bak-* backup
-python3 ilink.py watchdog [--max-age-mins N]           # hook heartbeat watchdog (default 30 minutes)
-python3 ilink.py stats                                 # offline snapshot: today's arrivals/claim wait/sends (no server calls)
-python3 ilink.py preflight                             # pre-login environment check
-python3 ilink.py prune-media [--dry-run]               # media retention cleanup (default 30 days + 500MB)
-python3 ilink.py smoke-test [--no-send]                # end-to-end self-check
-```
-
-The data directory defaults to `./data/` and can be overridden with the
-`ILINK_DATA_DIR` environment variable.
-
-## Known limitations (the fine print, up front)
-
-- **Outbound voice bubbles don't work (upstream limitation, awaiting
-  official support)**: the bot can *receive* voice messages (with WeChat's
-  transcript attached), but *sending* them is silently dropped server-side
-  by the iLink channel — the API returns success, yet the message never
-  renders in the client. Reproduced by this project and several
-  independent SDKs. This is a limitation of Tencent's channel, not of
-  this implementation; it has been requested in Tencent's official repo
-  (Tencent/openclaw-weixin #91, #282) and remains unimplemented. A
-  complete `send-voice` implementation (full SILK pipeline) ships in
-  this repo and will start working the moment the channel allows it.
-  Until then, audio can still be delivered as a file or video message.
-- **Tool-call progress messages don't go through (defined by the
-  protocol, ignored by the channel)**: the iLink protocol does define
-  these — message types 11 (`tool_call_start_item`) and 12
-  (`tool_call_result_item`) — and Tencent's official plugin sends one
-  each time the model calls a tool (a start message and a result message
-  carrying the tool name and a completed/failed/blocked status), meant
-  to render as "calling tool X…" progress in WeChat. Tested (Oct 2026):
-  sending them exactly as the official `reply-progress-sender.ts`
-  constructs them, with the envelope matching the official `send.ts`
-  field by field (message_type=2, message_state=2, tried with and
-  without run_id), the server answered HTTP 200 both times but with an
-  empty body and no message_id; the same envelope carrying plain text
-  returned a message_id normally. Conclusion: the server never creates
-  a message for this item type, so the client has nothing to render —
-  this is the channel not accepting them, not the client failing to
-  display them. Unlike outbound voice (API reports success, client
-  never renders), tool progress fails one step earlier: no message is
-  created at all. No workaround for now; while the worker is busy, the
-  "typing…" indicator remains the only progress signal.
-- **Outbound quotes don't work (channel-side, tested)**: the bot can
-  restore messages you quote (local quote cache), but it cannot send a
-  quoted reply itself. Tested (Oct 26, 2026): adding `ref_msg` to
-  sendmessage in both shapes seen on the inbound side (nested
-  `message_item.msg_id` and flat `msg_id`) — the server returned a
-  message_id and delivered both times, but WeChat rendered them as plain
-  messages with no quoted original above. No quote field exists in the
-  sendmessage structures of three independent SDKs either. Conclusion:
-  the outbound message schema has no quote concept at all — this is not
-  a formatting issue. Inbound and outbound are asymmetric: inbound full
-  quotes carry only the quoted msg_id (svr_id is just a fallback lookup
-  for refs that carry only svr_id), while outbound has no corresponding
-  field. This project therefore does not implement outbound quoting, and
-  does not fake it by pasting the original text into the message body.
-- **Session lifetime is uncertain**: early community reports suggested
-  roughly 24 hours, but in production a single login here has stayed valid
-  for 3+ days (Oct 2026); it may vary by account. Expiry means a human has
-  to re-scan the QR code (this repo only implements "notify once" —
-  re-scanning is still manual).
-- **Bots only see messages sent to the bot**: iLink is a separate bot
-  identity. It cannot see your main account's messages, contacts, or
-  Moments — the official protocol simply has no such endpoints. Anyone
-  claiming otherwise is using a reverse-engineered protocol (with ban risk).
-- **Your egress network needs to be stable**: cross-border links
-  occasionally cut long-polling connections; the client must back off and
-  reconnect (handled here — `POLL_ERROR` lines in the log are regulars and
-  harmless).
-- **Upgrades: no self-update**: release checks, update reminders and
-  one-reply install were removed. Upgrade in place by hand, following
-  section 5 of [`AGENTS.md`](AGENTS.md): stop the hook, let workers
-  finish and clear leftover queue files from the state dir, then swap
-  ilink.py and the hook scripts (keeping `.bak` backups —
-  `ilink.py rollback` restores them), then the worker prompt in the
-  hook definition (template: `examples/muse-hook/worker-prompt.md`),
-  and resume the hook; no re-scan, no re-bind. A bridge deployed from
-  the upstream repo upgrades the same way. Only the owner starts it,
-  from the main chat — never a WeChat message.
-- **In-chat slash commands: not implemented**: unlike Telegram, WeChat
-  shows no command menu when you type `/` — a slash command is just
-  plain text with no discovery entry point. The bot is an LLM, so
-  natural language already covers the same intents ("how are you
-  doing?", "forget what I said above"); admin actions (approving a
-  sender, upgrading) happen in the main chat only, never over WeChat.
-
-## Incident log: the night the bot sent "--key"
-
-At 00:11 on Oct 27, 2026, the owner told the bot good night before bed
-("a 醇我涂完了，我要睡觉了，晚安" — night routine done, off to sleep).
-The bot meant to reply "涂完就好，晚安，好好睡" (nicely done, good
-night, sleep well). What actually arrived was this:
-
-  <img src="docs/key-incident.jpg" alt="Screenshot of the bot replying '--key' to the owner's good night" width="300">
-
-What happened: the worker dropped the `-` text placeholder while
-assembling the send command, so the dedup flag `--key` slid into the
-text slot — and the bridge, which validated nothing about the text,
-sent it verbatim. The guard added afterwards: send/proactive now
-validate the text before any API call, and empty text or text starting
-with `--` is refused outright and only logged as refused. A malformed
-call now fails loudly instead of delivering a flag as a message.
-
-## Security notes
-
-`data/session.json` is a **login credential**, equivalent to a password: keep
-it local, it is already in `.gitignore`, and **never commit or share it**.
-The same goes for chat logs and the contacts cache.
-
-**Owner allowlist (enforced in code)**: `owner_ids` in `data/owner.json`
-is the only set of senders that can wake the bot (several accounts of the
-same human are fine; `owner_id` is the primary). Anyone else's messages
-are dropped at poll time: never queued, never waking the agent, never
-written to the contacts cache, media never downloaded. The sender's id
-is only recorded in `data/unknown_senders.json` for manual approval.
-With no `owner.json` at all, **everyone is denied** — complete step 2 of
-the quick start (`bind`) first. The binding window is a setup-time,
-10-minute affair — never leave one open unattended.
-
+- `data/session.json` is a **login credential**, like a password: keep it
+  local, never commit or share it.
+- The bot only receives messages sent to it; it cannot see your main
+  account's chats, contacts or Moments.
+- The iLink channel does not deliver voice messages the bot sends; send audio
+  as a file instead.
+  
 ## Acknowledgments
 
 The human-like reply polish borrows ideas — not code — from the
@@ -397,6 +188,7 @@ mistakes this for a copy):
 The protocol itself comes from Tencent's official iLink / openclaw-weixin
 ecosystem. WeChat decryption, desktop automation, and chat-history
 fine-tuning clones were all deliberately not used.
+
 
 ## License
 

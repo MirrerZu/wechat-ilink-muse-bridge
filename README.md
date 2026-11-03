@@ -1,28 +1,96 @@
 # wechat-ilink-muse-bridge
 
 [![CI](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/MirrerZu/wechat-ilink-muse-bridge)](https://github.com/MirrerZu/wechat-ilink-muse-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
 [中文](README.md) | [English](README.en.md)
 
-**把 Muse（Meta 的个人 AI 助理）接进微信。**
+**把 Muse 接进微信。**
 
-基于腾讯官方 iLink / ClawBot 协议（`ilinkai.weixin.qq.com`），扫码授权后，
-你的 Muse 分身就能在微信里实时收发消息：你发微信，它秒回；它也能
-主动给你推送提醒（快递、服务器告警、日程……），实现 App + 微信双通道。
+## 项目介绍
 
-核心客户端 `ilink.py` 不依赖任何框架，单独拿走就是一个极简 iLink 客户端；
-仓库同时给出两种长轮询接法：独立 `daemon.py`，和生产在用的 Muse hook 方案。
+基于腾讯官方 iLink 协议（`ilinkai.weixin.qq.com`）。扫码授权后，你给机器人发
+微信，Muse 的 worker 接住、回复；Muse 也能主动给你推送。文字、图片、文件、视频
+都能收发，语音能收；只有白名单里的主人能唤醒它。
 
-<p align="center">
-  <img src="docs/demo-chat-1.jpg" alt="真实使用截图：日常对话与发送视频" width="300">
-  <img src="docs/demo-chat-2.jpg" alt="真实使用截图：课程推送与每日摘要" width="300">
-  <br><em>真实使用截图：每日推送、日常对话、发送视频（敏感信息已打码）</em>
-</p>
+生产驱动是 Muse hook（`examples/muse-hook/`）：
 
-## 在 Muse 里快速部署
+```
+微信 ──> iLink 服务器 ──长轮询──> ilink-watch.sh（Muse hook，每 5 秒一轮）
+                                      │ 消息落盘 ilink-pending.json
+                                      ▼
+                              wake worker ──> ilink.py claim
+                                      │       批次 + 近 24 小时对话 + 今天的日志
+                                      ▼
+                              ilink.py send --lease ──> 微信
+                                      │       发送前并入新到的消息
+                                      ▼
+                              release ──> ilink-warm-wait.sh 守候追问
+```
+
+`ilink.py` 是不依赖框架的 iLink 客户端：收发消息、认领队列、媒体加解密、自检。
+本仓库 fork 自上游 wechat-ilink-muse-bridge，2026-11-03 起按生产数据重做了可靠性
+和回复延迟。
+
+## 优化点
+
+### 一批消息只叫一个 worker
+
+- hook 对同一批只 wake 一次。有守候中的 worker、或有开着的认领时不 wake；没人认领
+  的批次 180 秒后才补叫一次。
+- 认领改用 `ilink.py claim / renew / release`：加锁、带租约，取代原来的 `mv`。重复
+  启动的 worker 拿到 `CLAIM_BUSY` 直接退出；10 分钟没续租的认领被接管，已经回复过的
+  直接丢弃，不再叫人核查。
+- 发送带幂等 key（批次首条 `message_id`），同一个 key 不会发两次；网络错误用同一个
+  `client_id` 退避重试。
+- 去掉了自更新。升级按 [`AGENTS.md`](AGENTS.md) 第 5 节原地手动做，留备份，可回滚。
+
+### 少调几轮模型
+
+- `claim --recent --with <今天的日志>`：冷启动的 worker 一次调用就拿到批次、近 24
+  小时双方的原话、今天日志的尾部，不用再分几轮读记忆。
+- `send --lease`：发送前复查并进发送本身。期间有新消息就不发，打印 `SEND_DEFERRED`
+  和合并后的批次，worker 按最新上下文重写。
+- `ilink-warm-wait.sh` 守候时替 worker 认领，追问直接带着批次交给 worker。
+- `send --lease` 和 `release` 都会立起守候标记：worker 写日志的那十几秒里来的追问，
+  不会再叫起第二个冷启动的 worker。
+
+### 收件更快
+
+- 同一轮里的多张图、多个文件并行下载（最多 4 路）。
+- 后台点亮"正在输入"的子进程不再占着 hook 的锁。以前每批消息之后，下一轮都被跳过。
+- 队列里有批次、本轮又不需要叫人时照常 poll，新消息在队列锁里接到后面。以前 worker
+  写回复期间补发的消息要压在服务端等它写完。
+- hook 间隔定为 5 秒。
+
+### 部署和观测
+
+- hook 脚本先读同目录的 `ilink-hook.env`：hook 定义没有环境变量字段的运行时（比如要
+  用 venv 里的 python）也能原样装新脚本，升级不覆盖它。
+- `ilink-events.jsonl` 给每批消息记下到达、唤醒、认领、合并、放下（只有 id、条数和
+  时间，不含正文）。到达事件带 `poll_secs` 和 `lag_secs`；`ilink.py stats` 汇总当天
+  的收件延迟和认领等待。
+
+## 优化后的效果
+
+2026-11-03 在生产上实测：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| 唤醒 | 一天 236 次 wake，一批最多被叫约 95 次；34 个 worker 里 30 个在核查已经做完的事 | 每批 1 次，不出现第二个 worker |
+| 冷启动回复（消息到达 → 第一个气泡） | 一个回合约 36 秒（桥的工具只占 0.4 秒，其余是一轮 3–9 秒的模型调用） | 16 秒 |
+| 守候中的追问 | — | 13 秒 |
+| 多张图进队列 | 4 张图串行下载 9 秒 | 10 张图（2.4 MB）并行 4.3 秒 |
+| 回复期间补发的消息 | 一句文字晚到 17 秒，还多一次重写 | 0–9 秒 |
+| 收件延迟 / 认领等待（中位数） | — | 0 秒 / 1 秒 |
+
+还在观察的事项（冷启动第一轮时快时慢、连发多图时先写一版再重写等）见
+[`docs/latency-followups.md`](docs/latency-followups.md)。
+
+## 使用说明
+
+### 新部署
 
 把这句话发给你的 Muse：
 
@@ -30,274 +98,55 @@
 帮我用 wechat-ilink-muse-bridge 把微信接入你：https://github.com/MirrerZu/wechat-ilink-muse-bridge
 ```
 
-它会按仓库根目录的 [`AGENTS.md`](AGENTS.md) 自己完成部署，你只需要
-在扫码那一步拿出微信扫一下。
+它会按 [`AGENTS.md`](AGENTS.md) 自己完成部署，你只需要做两件事：
 
-登录后它还会请你在 **10 分钟内给机器人发第一条消息**完成主人绑定：
-第一个发信的账号即成为 Owner，并会收到三条欢迎消息；超时没发，
-它会再次提醒你并重开绑定窗口。
+1. 用微信扫它给你的二维码。
+2. 它提示后，**10 分钟内给机器人发任意一条消息**完成主人绑定。第一个发信的账号成为
+   Owner，会收到三条欢迎消息；超时没发，它会再提醒你、重开绑定窗口。
 
-部署完成后还有一个日常流程值得知道：**添加新发信人**。名单外的人
-（比如你自己的另一个微信号）给机器人发消息时不会被理会，但其 ID
-会记进 `data/unknown_senders.json`（待批名单）。想放行时，直接在
-Muse 的主聊天里说一句"把待批名单里的加进白名单"，它会把待批 ID
-连同出现次数列给你确认，再写入 `owner.json`，下一轮轮询即生效。
-批准只能从主聊天发起——微信对话里说得再好听也不算数，这是防陌生人
-把自己"聊进"白名单的锁。
+### 升级已有部署
 
-## 特性
-
-- **官方协议，扫码登录** — 不用逆向、不用挂个人号，走腾讯 iLink 官方通道
-- **长轮询实时收消息** — 服务端 hold 住连接最长 35s，有消息立即返回，
-  延迟秒级（同类项目清一色这个做法，本仓库的参数与退避策略可直接抄）
-- **连发消息合并** — 用户连发几条会被 iLink 拆成多个响应；本仓库的做法是
-  **发送前复查**：回复组织好、真正发出之前再看一眼有没有新消息进来，
-  有就合并成一轮、按最新上下文回，只回一条。**调研过的所有同类 SDK
-  都不做这个**，直接逐条回复的机器人会显得很机械，还会慢一拍答非所问
-- **发送图片/文件/视频** — 走 `getuploadurl` 申请上传 → AES-128-ECB 加密 →
-  CDN 上传 → `sendmessage` 带媒体 item，图片、文件、视频都支持（回复和主动
-  推送两种模式）。协议细节有坑（两处枚举/编码不一致），代码里有注释
-- **"正在输入"状态** — 回复生成期间自动亮起 typing 指示
-  （`getconfig` 取 `typing_ticket` + `sendtyping` 开关，票据缓存 9 分钟），
-  等待不干等，对方能看到机器人"活着"
-- **主动推送** — 协议“文档”没写，但 `sendmessage` 配合缓存的
-  `context_token` 可以主动给用户发消息（token 失效时有无 token 兜底重试）
-- **媒体下载断点续传** — 图片/文件走加密 CDN，下载中断用 HTTP Range
-  续传 + 指数退避重试（弱网下整图重下经常死在 90%）
-- **发送防重复** — 发送失败绝不手动重试（服务端偶尔收了消息却不回
-  回执，盲目重试 = 用户收到两条）
-- **入站去重** — 服务端偶尔会重复投递同一条消息；poll 按 `message_id`
-  过滤（最近 500 条落盘记录），同一条消息不会被回复两遍
-- **主人白名单** — 只有 `owner.json` 名单内的微信号能唤醒机器人
-  （代码层强制，同一人的多个账号可以都加）；名单外消息在 poll 阶段
-  直接丢弃、不入队不唤醒，发信人 ID 只进待批名单等你人工确认；
-  没配名单时默认拒绝所有人
-- **告警闭环** — 不只报坏也报好：授权过期先报一次、每小时复报；
-  轮询连续失败满 10 分钟才报（防抖动误报）；恢复正常后报一句平安；
-  worker 处理卡住超 10 分钟会自动回收队列并告警
-- **health 自检** — `ilink.py health` 一条命令看全状态：登录时长、
-  token 在线探活、队列积压、最近轮询错误，退出码 0/1/2 可直接接监控
-- **token 过期只吵一次** — 过期后落一个标记文件，只通知用户重扫一次
-- **引用消息还原** — 微信里引用一条消息再提问时，机器人能看到被引的原文
-  （文字、文件都行）：poll 保留服务端下发的引用关系，本地缓存 id→原文
-  30 天/1 万条，机器人自发消息也进缓存；缓存建立之前的旧消息无法事后
-  补（服务端没有按 id 取原文的接口）
-- **存活看门狗** — hook 每轮 touch 心跳，`ilink.py watchdog` 判 30 分钟
-  过期，15 分钟 cron 首报 + 恢复报、重复过期静默；桥有意停用时 touch
-  维护标记即可静音
-- **运维命令** — `rollback`（从最新 .bak-* 备份恢复）、`stats`（纯本地
-  快照，不调服务端）、`preflight`（登录前环境预检）、`smoke-test`
-  （端到端冒烟自检）、`prune-media`（媒体保留清理），详见下方速查表
-- **打磨拟人化的回复** — 回复先像人打字：长句拆成短句，先给结论
-  再说细节，说大白话、不用模板套话；内容自然分段时拆成 2~3 个短
-  气泡（先接一句、再说正事、最后问一句），不把一句话硬切成两半；
-  情绪不跳变、隔夜隔天自然接续；发之前按语气、长度、用词、结构、
-  情感直接度自检一遍。复杂技术内容仍允许长句保真，短句默认不压
-  倒准确。详见 `AGENTS.md` 回复形态条款
-
-## 出站消息的 Markdown 渲染
-
-机器人发出的文本消息，微信客户端会按 Markdown 渲染，不用特意转纯文本
-（2026-10-25 在 Android 微信客户端上实测三轮确认）：
-
-能渲染：多级标题、粗体、行内代码、代码块（带语言标签、“复制”按钮、
-语法高亮）、无序 / 有序 / 嵌套列表、链接、表格、删除线、引用、分割线。
-
-不能渲染：任务列表（退化成圆点 + 原样 `[ ]` / `[x]`）、图片语法
-（只剩 alt 文字，不出图——想发图请用 `send-image` / `proactive-image`）、
-公式（`$` 被去掉、内容原样显示，不成数学式）。
-
-斜体已用英文确认：`*...*` 与 `_..._` 均渲染，`***...***` 为粗斜体；
-中文下斜体效果不明显。以上为 Android 微信客户端实测，其他客户端 /
-版本可能有差异。
-
-## 和同类项目的区别
-
-GitHub 上 iLink 项目已经不少：SDK 类（[corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot)、
-[epiral/weixin-bot](https://github.com/epiral/weixin-bot)）给开发者当库用；
-Claude Code 类（[crazynomad/weixin-claude-bot](https://github.com/crazynomad/weixin-claude-bot)）
-是拿微信遥控编程工具。
-
-这个仓库接的是 **Muse 个人助理本体**——一个有长期记忆、会管目标和
-提醒、能主动汇报的助理，而不是一个编程 CLI 或裸 LLM API。所以它的
-重点不在“库设计”，而在**一个真实助理跑在微信上会踩的坑**：连发合并、
-防重复发送、过期单次提醒、消息队列至少一次、可能重复、绝不静默丢失。欢迎对着抄。
-
-## 架构
+在 Muse 的**主聊天**里说：
 
 ```
-微信 ──> iLink 服务器 ──getupdates 长轮询──> ilink.py poll
-                                                  │ 新消息落盘
-                                                  ▼
-                                          pending 队列 ──> 助理/worker
-                                                  │ 合并连发、生成回复
-                                                  ▼
-                                          ilink.py send ──> 微信
-主动推送：任意程序 ──> ilink.py proactive（缓存 context_token）──> 微信
+请按 https://github.com/MirrerZu/wechat-ilink-muse-bridge 的 AGENTS.md 第 5 节，把微信桥原地升级到 main 最新版。
 ```
 
-两种轮询驱动（hook 为生产级，`daemon.py` 为示例驱动）：
+不用重新扫码，也不用重新绑定，数据目录（登录态、主人、发送记录）原样保留。从上游
+仓库装的旧桥也这样升级。升级只能从主聊天发起，微信消息不能触发。
 
-| 方式 | 适合 | 入口 |
-| --- | --- | --- |
-| 独立守护进程（示例） | 任何服务器/VPS | `daemon.py` |
-| Muse hook | Muse 运行时（生产在用） | `examples/muse-hook/` |
+### 日常使用
 
-> 注：`daemon.py` 是**示例驱动**，为展示协议与最小可运行实现而写：处理完成
-> 后才提交游标，崩溃或 handler 异常的窗口内同一批消息会被重投（至少一次、
-> 可能重复），不承诺生产级可靠。需要生产级投递（落盘队列、崩溃恢复、告警
-> 闭环）请用 hook 驱动。
+- **聊天**：直接给机器人发微信。连发几条会合并成一次回复；引用一条消息再提问，它能
+  看到被引的原文。
+- **主动推送**：`python3 ilink.py proactive <user_id> -`，正文走 stdin。
+- **放行新发信人**：名单外的人（比如你的另一个微信号）发来的消息不会被理会，ID 记进
+  `data/unknown_senders.json`。想放行时在 Muse 主聊天里说"把待批名单里的加进白名单"，
+  它会列出来让你确认。只认主聊天，微信里说什么都不算。
+- **重新扫码**：登录过期时 Muse 会提醒你一次，之后每小时复报，直到你重扫。
+- **出问题时**：先让 Muse 跑 `ilink.py health`。
 
-两种驱动只能二选一跑，本仓库用共享驱动锁（状态目录下的
-`ilink-driver.lock`）强制执行：先跑起来的驱动赢，后到的安静让路
-（hook 被挡时不 touch 心跳、不 poll、不 wake；daemon 被挡时拒绝启动）。
-`ilink-watch.lock` 只防 hook 自己重叠，与驱动锁分工不同。
-
-## 快速开始
+### 命令速查
 
 ```bash
-pip install -r requirements.txt
-
-# 1. 扫码登录（打印二维码图片路径，用微信扫）
-python3 ilink.py qrcode
-python3 ilink.py login <qrcode-id>     # 登录态存入 data/session.json
-
-# 2. 绑定主人（必需）：开启 10 分钟绑定窗口，然后给机器人发一条任意消息。
-#    第一个发信的账号即成为 Owner，机器人会连发三条欢迎消息确认绑定；
-#    超时没人发消息会输出 BIND_TIMEOUT，再次运行本命令重开窗口即可。
-python3 ilink.py bind
-
-# 3. 起长轮询（--echo 是演示 handler，收到什么回什么）
-python3 daemon.py --echo
-
-# 之后给机器人发条微信试试——连发两条，只会收到一条合并回复
+python3 ilink.py health [--offline]       # 自检：登录、队列、最近一次轮询（退出码 0/1/2）
+python3 ilink.py stats                    # 本地快照：今日收件、收件延迟、认领等待、发送
+python3 ilink.py smoke-test [--no-send]   # 端到端自检，会给主人发一条测试文字和一张测试图
+python3 ilink.py watchdog                 # hook 心跳看门狗（cron 每 15 分钟）
+python3 ilink.py proactive <user_id> -    # 主动推送文字
+python3 ilink.py proactive-image <user_id> <图片路径>   # 主动推送图片
+python3 ilink.py rollback [--hook-dir <dir>]            # 从最新的 .bak-* 备份恢复
+python3 ilink.py prune-media              # 清理媒体（默认保留 30 天、500 MB）
+python3 ilink.py preflight                # 登录前环境预检
 ```
 
-想让回复来自大模型（OpenAI 兼容接口，OpenAI / DeepSeek / 通义 / Moonshot / 本地 Ollama 都行），换 `--llm` 模式，配置走环境变量：
+数据目录默认 `./data/`，用环境变量 `ILINK_DATA_DIR` 改。完整命令见 `python3 ilink.py`。
 
-```bash
-LLM_API_KEY=sk-... python3 daemon.py --llm
-# 可选：LLM_BASE_URL（默认 https://api.openai.com/v1）、LLM_MODEL（默认 gpt-4o-mini）、LLM_SYSTEM_PROMPT
-```
+### 注意
 
-`--llm` 是示例 handler：带每用户最近 10 条上下文、纯标准库实现。需要工具调用/长期记忆的 Agent 接法见 `examples/muse-hook/`。
-
-也可以用 Docker 部署——这条路线主要面向**在自己 VPS / NAS 上自托管**
-的用户：把独立 `daemon.py` 挂在服务器上 24 小时跑，不依赖 Muse 环境。
-（在 Muse 里部署走上面的 AGENTS.md 方式即可，不需要 Docker——
-Muse 的运行环境里通常也没有 Docker。）登录态和媒体存在 `./data` 卷里：
-
-```bash
-docker compose run --rm bot python3 ilink.py qrcode        # 扫码登录一次
-docker compose run --rm bot python3 ilink.py login <qrcode-id>
-docker compose run --rm bot python3 ilink.py bind          # 10 分钟内发条消息绑定主人
-docker compose up -d                                        # 默认 --echo 模式
-```
-
-单条命令速查：
-
-```bash
-python3 ilink.py bind                                   # 绑定主人（10 分钟窗口，首个发信人成为 Owner）
-python3 ilink.py poll                                   # 拉一轮新消息（JSON）
-python3 ilink.py send <user_id> <context_token> -       # 发回复（正文走 stdin）
-python3 ilink.py proactive <user_id> -                  # 主动推送（正文走 stdin）
-python3 ilink.py typing <user_id> <start|stop>          # 显示/取消"正在输入"
-python3 ilink.py send-image <user_id> <ctx> <图片路径>   # 回复一张图片
-python3 ilink.py send-file <user_id> <ctx> <文件路径>    # 回复一个文件
-python3 ilink.py send-video <user_id> <ctx> <视频路径>   # 回复一个视频
-python3 ilink.py proactive-image <user_id> <图片路径>    # 主动推送图片
-python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文件
-python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视频
-python3 ilink.py rollback [--hook-dir <dir>]           # 从最新 .bak-* 备份恢复
-python3 ilink.py watchdog [--max-age-mins N]           # hook 心跳看门狗（默认 30 分钟）
-python3 ilink.py stats                                 # 本地快照：今日收件/认领等待/发送（不调服务端）
-python3 ilink.py preflight                             # 登录前环境预检
-python3 ilink.py prune-media [--dry-run]               # 媒体保留清理（默认 30 天 + 500MB）
-python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
-```
-
-数据目录默认 `./data/`，可用环境变量 `ILINK_DATA_DIR` 覆盖。
-
-## 已知限制（先说丑话）
-
-- **发不出语音条（官方限制，等官方支持）**：机器人可以**收**语音
-  （带微信自动转写），但**发**语音条目前不行——iLink 通道会在服务端
-  静默丢弃机器人发出的语音消息（接口返回成功、客户端永不显示），
-  本项目与多个独立 SDK 均已实测复现。这是腾讯通道侧的限制，
-  不是实现问题；社区已在腾讯官方仓库提出需求
-  （Tencent/openclaw-weixin #91、#282），至今未开放。本项目已实现
-  并保留 `send-voice`（SILK 编码全链路），官方一旦支持即可直接
-  启用。在此之前想让机器人“出声”，可把音频当文件或视频发送。
-- **工具调用进度消息发不出去（接口有、通道不用）**：iLink 协议里
-  确实定义了这东西——消息类型 11（`tool_call_start_item`）和 12
-  （`tool_call_result_item`），腾讯官方插件也会在模型每次调工具时
-  各发一条（开始一条、结束一条，带工具名和 completed/failed/blocked
-  状态），本意是让微信里显示“正在调某某工具…”的进度。实测
-  （2026-10）：按官方 `reply-progress-sender.ts` 的原样构造发送，
-  信封与官方 `send.ts` 逐项一致（message_type=2、message_state=2，
-  带 run_id 与不带 run_id 两种都试过），服务端两次都回 HTTP 200
-  但包体为空、不给 message_id；同一套信封发普通文本则正常返回
-  message_id。结论：服务端根本没给这类消息建消息，微信客户端也就
-  无从渲染——不是客户端不支持，是通道侧直接没接。跟发语音条的
-  区别：语音是接口回成功、客户端不显示；工具进度是更早一步，连
-  消息都没生成。此项目前无解，worker 干活时仍只能用“正在输入”
-  圆点表示进度。
-- **出站引用发不出去（通道侧不支持，实测）**：机器人能还原你引用
-  的消息（本地引用缓存），但机器人自己发消息时带引用不行。实测
-  （2026-10-26）：往 sendmessage 里加 `ref_msg`，入站一侧出现过的
-  两种形式都试过（`message_item.msg_id` 嵌套形式、直接放 `msg_id` 的
-  平铺形式），服务端两次都返回 message_id、照常投递，但微信里只
-  显示成普通消息、上方没有被引原文；三家独立 SDK 的 sendmessage
-  结构里也没有引用字段。结论：发送结构里根本没有引用这个概念，
-  不是格式问题。入站与出站不对称：入站完整引用只带被引消息的
-  msg_id（svr_id 只是备用查找路径），出站则完全没有对应字段。本
-  项目因此不实现出站引用，也不用“正文前贴原文”冒充引用。
-- **登录态寿命不确定**：社区早期经验说约 24 小时，但本项目生产实测
-  一次登录已稳定运行 3 天以上未过期（2026-10），可能因账号而异；
-  真过期时需重新扫码（本仓库做了“过期只通知一次”，重扫还得人来）。
-- **只能收到主动发给机器人的消息**：iLink 是独立的机器人身份，
-  看不到你主号的消息、通讯录、朋友圈——官方协议里根本没有这些端点，
-  谁说有谁就是在用逆向协议（有封号风险）。
-- **出口网络要稳**：长轮询连接会被跨国链路偶发切断，客户端需退避重连
-  （本仓库已处理，日志里 `POLL_ERROR` 是常客，不影响使用）。
-- **升级：没有自动更新**：版本检查、更新提醒和一键安装都已移除。
-  升级按 [`AGENTS.md`](AGENTS.md) 第 5 节原地手动做：先停 hook、等
-  worker 收尾、清掉状态目录里的残留队列文件，再换 ilink.py 和 hook
-  脚本（留 `.bak` 备份，出问题 `ilink.py rollback`），然后换 hook
-  定义里的 worker 指令（模板在 `examples/muse-hook/worker-prompt.md`），
-  最后恢复 hook；不重新扫码、不重新绑定。从上游仓库部署的旧桥也走
-  这一节。只由主人在主聊天里发起，微信消息不能触发。
-- **微信内斜杠命令：不做**：微信不像 Telegram，输入 / 不会弹出
-  命令菜单，斜杠命令发出去只是普通文字、没有发现入口；分身是
-  LLM，自然语言已覆盖同类意图（“状态怎么样”“忘掉上面说的”
-  直接说就行）；批准新发信人、升级这类管理操作只在主聊天里做，
-  不走微信。
-
-## 事故手记：分身有天半夜发了句 --key
-
-2026-10-27 凌晨 00:11，主人睡前跟分身说“a 醇我涂完了，我要睡觉了，
-晚安”，分身想回“涂完就好，晚安，好好睡”，结果发出去的却是下面这句：
-
-  <img src="docs/key-incident.jpg" alt="分身误发 --key 的截图：主人说晚安，分身回了 --key" width="300">
-
-原因：worker 拼发送命令时漏了正文占位符 `-`，防重复的 `--key`
-滑进正文位置，而桥当时对正文没有任何校验，就原样发出去了。
-事后补的守卫：send/proactive 在真正发出去之前先验正文，空正文、
-或以 `--` 开头的，一律拒绝、不发、只记一条拒绝审计。传错只会
-报错，不会再把标志当消息发出来。
-
-## 安全说明
-
-`data/session.json` 是**登录凭证**，等同于密码：只留在本地，已写进
-`.gitignore`，**永远不要提交、不要分享**。聊天记录、联系人缓存同理。
-
-**主人白名单（代码层强制）**：`data/owner.json` 的 `owner_ids` 是唯一
-能唤醒机器人的发信人名单（同一人的多个微信号可以都填上，`owner_id`
-是主号）。名单外的消息在 poll 阶段就被丢弃：不入队、不唤醒、不写
-联系人缓存、媒体不下载；发信人的 ID 只会记进
-`data/unknown_senders.json` 待你人工确认添加。没配 `owner.json` 时
-**默认拒绝所有人**，先按快速开始第 2 步用 `bind` 完成绑定。绑定窗口
-只在部署时当场开启、限时 10 分钟——不要无人值守地开着窗口等人来。
+- `data/session.json` 是**登录凭证**，等同于密码：只留在本地，不要提交、不要分享。
+- 机器人只能收到发给它的消息，看不到你主号的聊天、通讯录和朋友圈。
+- iLink 通道不投递机器人发出的语音条，想让它"出声"可以把音频当文件发。
 
 ## 致谢与参考
 
