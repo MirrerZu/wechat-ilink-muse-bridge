@@ -9,7 +9,9 @@
 - `<HOOK_SCRIPTS_DIR>`：`ilink-watch.sh` / `ilink-warm-wait.sh` 部署所在目录
 
 状态目录必须与 hook 脚本、`ilink.py health` 一致（默认 `~/hooks/state`，
-或 `ILINK_HOOK_STATE_DIR`）。没有 venv 时删掉 PATH 那一句。
+或 `ILINK_HOOK_STATE_DIR`）。没有 venv 时删掉 PATH 那一句。第 11–13 条
+按 `muse.memory_search`、`~/MEMORY.md`、`~/memory/wechat/` 这套记忆
+布局写的；本机的记忆工具或路径不同，就改成本机的，其余条款不要动。
 
 认领协议（claim / renew / release）需要 2026-11-03 之后的 `ilink.py`：
 **先部署代码，再换这份指令**，顺序反了 worker 会因为没有 `claim` 命令而

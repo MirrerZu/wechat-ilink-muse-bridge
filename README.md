@@ -263,11 +263,12 @@ python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
 - **出口网络要稳**：长轮询连接会被跨国链路偶发切断，客户端需退避重连
   （本仓库已处理，日志里 `POLL_ERROR` 是常客，不影响使用）。
 - **升级：没有自动更新**：版本检查、更新提醒和一键安装都已移除。
-  升级按 [`AGENTS.md`](AGENTS.md) 第 5 节原地手动做：先换 ilink.py
-  和 hook 脚本（留 `.bak` 备份，出问题 `ilink.py rollback`），再换
-  hook 定义里的 worker 指令（模板在
-  `examples/muse-hook/worker-prompt.md`），不重新扫码、不重新绑定。
-  只由主人在主聊天里发起，微信消息不能触发。
+  升级按 [`AGENTS.md`](AGENTS.md) 第 5 节原地手动做：先停 hook、等
+  worker 收尾、清掉状态目录里的残留队列文件，再换 ilink.py 和 hook
+  脚本（留 `.bak` 备份，出问题 `ilink.py rollback`），然后换 hook
+  定义里的 worker 指令（模板在 `examples/muse-hook/worker-prompt.md`），
+  最后恢复 hook；不重新扫码、不重新绑定。从上游仓库部署的旧桥也走
+  这一节。只由主人在主聊天里发起，微信消息不能触发。
 - **微信内斜杠命令：不做**：微信不像 Telegram，输入 / 不会弹出
   命令菜单，斜杠命令发出去只是普通文字、没有发现入口；分身是
   LLM，自然语言已覆盖同类意图（“状态怎么样”“忘掉上面说的”

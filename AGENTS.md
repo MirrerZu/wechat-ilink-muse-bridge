@@ -4,6 +4,11 @@ You are an AI agent (typically Muse) whose user asked you to connect WeChat
 to yourself using this repository. Follow these steps. Only one step needs
 the human: scanning a QR code.
 
+Pick the path first. A **fresh install** — no `session.json` or
+`owner.json` in the data dir yet — runs steps 0–4. A bridge that is
+**already deployed**, from this repo or from the upstream repo it was
+forked from, goes straight to step 5 and never re-runs steps 0–1.5.
+
 ## 0. Prerequisites
 
 - Python 3.10+ and `pip install -r requirements.txt` (the only hard
@@ -67,12 +72,26 @@ inside a WeChat conversation itself.
 ## 2. Choose a driver
 
 **If you run inside Muse with its hook runtime available** (production
-setup): wire `examples/muse-hook/ilink-watch.sh` as a hook that runs every
-~5–10 seconds. Read `examples/muse-hook/README.md` first — the script
-persists each batch to a pending queue before waking you, and you claim
-it with `ilink.py claim`. The worker prompt for the hook definition is
-`examples/muse-hook/worker-prompt.md`: paste its code block in whole and
-fill in the paths. When woken, handle the batch under this contract:
+setup), read `examples/muse-hook/README.md` first, then set the hook up:
+
+1. Copy `examples/muse-hook/ilink-watch.sh` and `ilink-warm-wait.sh`
+   into a scripts dir (e.g. `~/hooks/scripts/`) and `chmod +x` both.
+2. Register `ilink-watch.sh` as a hook that runs every ~5–10 seconds,
+   with `ILINK_DATA_DIR` (the step 0 data dir) and `ILINK_CLIENT` (the
+   absolute path of `ilink.py`) set in its environment. Both are
+   required: the script's own fallbacks (`~/wechat-ilink-data`, and
+   `ilink.py` inside it) do not match `ilink.py`'s `./data/`. The state
+   dir defaults to `~/hooks/state`; if you change it with
+   `ILINK_HOOK_STATE_DIR`, give `ilink.py` the same value.
+3. Worker prompt: paste the code block of
+   `examples/muse-hook/worker-prompt.md` into the hook definition in
+   whole, placeholders filled in.
+4. Crons, with the same environment: `ilink.py watchdog` every 15
+   minutes, `ilink.py rotate-chatlog` monthly (see step 4).
+
+The script persists each batch to a pending queue before waking you,
+and you claim it with `ilink.py claim`. When woken, handle the batch
+under this contract (the worker prompt is its condensed form):
 
 - Reply only to the owner. Enforcement is in code, not on you: `poll`
   only queues senders allowlisted in `owner.json` (`owner_ids`), so any
@@ -264,49 +283,102 @@ legs.
 
 Use this when the bridge is already logged in and bound and you only
 need newer code — for example when asked to "redeploy from the repo".
+It applies the same way to a bridge deployed from the upstream repo
+(see the notes after the steps). A fresh install skips this section.
 It is not a fresh deployment:
 
 - Do NOT re-run steps 0–1.5. No `qrcode` / `login` (a new login replaces
-  the working token), no `bind` (one-time). Never touch the data dir
-  (`session.json`, `owner.json`, `send_ledger.json`, contacts, seen ids,
-  cursor, quote cache): it carries the login, the owner, dedupe and the
-  send history the new code relies on.
-- Do not start `daemon.py`, and do not stop the hook to upgrade: the
-  scripts are swapped atomically below, and a worker still mid-batch
-  under the old prompt is handled by the new code (it finishes, or its
-  claim is taken over after 10 minutes).
+  the working token), no `bind` (one-time). Never delete or rewrite the
+  data dir (`session.json`, `owner.json`, `send_ledger.json`, contacts,
+  seen ids, cursor, quote cache) — the one exception is the two
+  counters step 3 resets. It carries the login, the owner, dedupe and
+  the send history the new code relies on. Deleting it fixes nothing
+  an upgrade does not, and costs a re-scan, a re-bind and the dedupe
+  history (old messages come back as new ones).
+- Do not start `daemon.py`.
+- Upgrade with the bridge quiesced: hook stopped, no bridge worker
+  running, no bridge wake queued, no queue file in the state dir.
+  Swapping under live traffic has two failure modes: a worker started
+  from a wake queued before the swap can still run the old prompt and
+  `mv` over a new worker's claim; and the new code "recovers" leftover
+  queue files whose messages were in fact answered (merged into another
+  reply under a different key), so the owner gets a late duplicate
+  reply. Messages sent while the hook is stopped stay on the server and
+  are fetched on resume — nothing is lost.
 
 Steps:
 
-1. Fetch the target version into a fresh directory (clone or checkout),
+1. Stop: disable the hook in the hook definition, and `touch
+   ilink-watchdog-off` in the hook state dir (it silences the watchdog
+   and the `hook_gap` report for the pause).
+2. Drain: wait until no bridge worker is running, and cancel every wake
+   the runtime still holds for the bridge. Find out whether the runtime
+   binds the worker prompt when the wake is queued or when the worker
+   starts; if when queued, no wake from before step 10 may remain.
+3. Clear the state dir. For each `ilink-pending.json`,
+   `ilink-processing*.json` and `*.corrupt-*`, check against the send
+   ledger and the chat log whether its messages were answered. Move
+   answered ones into `archive-<YYYYMMDD>/` inside the state dir (never
+   delete them); list unanswered ones to the owner in the main chat and
+   let the owner decide. With no worker left, `ilink-warm.json` (and
+   `ilink-woken.json`, if present) are stale markers: archive them too.
+   Leave `ilink-commit-pending.json` in place — it is an uncommitted
+   poll cursor the hook retries first. Set `stuck_since` and
+   `stuck_last` in the data dir's `alert-state.json` to 0. No queue
+   file may be left in the state dir itself.
+4. Fetch the target version into a fresh directory (clone or checkout),
    never over the live one.
-2. Back up what you will replace, as `<file>.bak-<YYYYMMDD>-<label>`
+5. Back up what you will replace, as `<file>.bak-<YYYYMMDD>-<label>`
    next to each file, with a plain `cp` (no `-p`: `ilink.py rollback`
    picks the newest `.bak-*` by mtime): the live `ilink.py` and both
    deployed hook scripts. Save the current worker prompt from the hook
    definition to a file as well.
-3. Check the new files before they go live: `python3 -m py_compile
-   ilink.py`, `bash -n` on both scripts.
-4. Install each file by copying it to a temp name in the target
-   directory, then `mv` over the live one (the hook runs every few
-   seconds; it must never execute a half-copied script). If the
-   deployment keeps a copy of `AGENTS.md` and the `examples/` docs next
-   to `ilink.py`, refresh those too, so no one reads a stale contract.
-5. Check the code: `ilink.py health` (expect `verdict: OK` or warnings
-   you can explain) and confirm the usage text lists `claim`. Do NOT
-   try `ilink.py claim` on the live queue — it would take a real batch.
-6. Only now replace the worker prompt in the hook definition with the
-   code block of `examples/muse-hook/worker-prompt.md`, paths filled
-   in. Keep the hook interval unchanged. Code first, prompt second: a
-   new prompt on old code calls a `claim` command that does not exist.
-7. Verify end to end: ask the owner for one WeChat message, then read
-   `ilink-events.jsonl` in the hook state dir — expect one `arrive`,
-   one `wake`, one `claim` (note its `oldest_wait_secs`) and one
-   `release`, and exactly one reply in WeChat.
+6. Check the new files before they go live: `python3 -m py_compile
+   ilink.py`, `bash -n` on both scripts. Compare the path lines at the
+   top of the live scripts (`BRIDGE=`, `STATE_DIR=`) with the new
+   ones: if the deployment edited them instead of setting
+   `ILINK_DATA_DIR` / `ILINK_CLIENT` in the hook's environment, move
+   those values into the environment now — the new copies carry the
+   repo defaults, and a hook pointed at the wrong data dir polls
+   nothing.
+7. Install each file by copying it to a temp name in the target
+   directory, then `mv` over the live one, so no half-copied file is
+   ever in place. If the deployment keeps a copy of `AGENTS.md` and
+   the `examples/` docs next to `ilink.py`, refresh those too, so no
+   one reads a stale contract.
+8. Check the code: `ilink.py health` (expect `verdict: OK` or warnings
+   you can explain) and confirm the usage text lists `claim`.
+9. Replace the worker prompt in the hook definition with the code block
+   of `examples/muse-hook/worker-prompt.md`, paths filled in. Code
+   first, prompt second: a new prompt on old code calls a `claim`
+   command that does not exist.
+10. Resume: re-enable the hook with its interval unchanged. After its
+    first round, remove `ilink-watchdog-off`.
+11. Verify end to end: ask the owner for one WeChat message, then read
+    `ilink-events.jsonl` in the hook state dir — expect one `arrive`,
+    one `wake`, one `claim` (note its `oldest_wait_secs`) and one
+    `release`, and exactly one reply in WeChat.
 
-Rollback: `ilink.py rollback --hook-dir <dir>` restores the newest
-backups of `ilink.py` and the hook scripts; put the saved worker prompt
-back into the hook definition.
+Coming from the upstream repo — the same steps, plus:
+
+- Step 4 fetches from this repo. Do not `git pull` it into the live
+  upstream checkout, and do not run the old `update-to`: it installs
+  upstream releases, and this repo has none.
+- Step 9 replaces the old worker prompt entirely; do not merge rules
+  into it. Prompts written against the upstream contract claim with
+  `mv` and handle 订阅 / 安装更新 by running `subscribe` /
+  `update-to`, commands that no longer exist.
+- Remove any cron or scheduled task that runs `version-check` or
+  `update-to`. The leftover `subscribe_ask.json`, `update_offer.json`,
+  `version_notify.json` and `vc_last` in `alert-state.json` are no
+  longer read; leave them.
+- Then go through the hook setup list in step 2 and add what the old
+  deployment lacks (most often the `watchdog` cron).
+
+Rollback: quiesce the same way (steps 1–3), then `ilink.py rollback
+--hook-dir <dir>` restores the newest backups of `ilink.py` and the
+hook scripts; put the saved worker prompt back into the hook
+definition and resume (step 10).
 
 There is no self-update: release checks, update notices and
 `update-to` were removed. This section is the only upgrade path, and

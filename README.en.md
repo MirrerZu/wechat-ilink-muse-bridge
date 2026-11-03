@@ -332,11 +332,14 @@ The data directory defaults to `./data/` and can be overridden with the
   harmless).
 - **Upgrades: no self-update**: release checks, update reminders and
   one-reply install were removed. Upgrade in place by hand, following
-  section 5 of [`AGENTS.md`](AGENTS.md): swap ilink.py and the hook
-  scripts first (keeping `.bak` backups — `ilink.py rollback` restores
-  them), then the worker prompt in the hook definition (template:
-  `examples/muse-hook/worker-prompt.md`); no re-scan, no re-bind. Only
-  the owner starts it, from the main chat — never a WeChat message.
+  section 5 of [`AGENTS.md`](AGENTS.md): stop the hook, let workers
+  finish and clear leftover queue files from the state dir, then swap
+  ilink.py and the hook scripts (keeping `.bak` backups —
+  `ilink.py rollback` restores them), then the worker prompt in the
+  hook definition (template: `examples/muse-hook/worker-prompt.md`),
+  and resume the hook; no re-scan, no re-bind. A bridge deployed from
+  the upstream repo upgrades the same way. Only the owner starts it,
+  from the main chat — never a WeChat message.
 - **In-chat slash commands: not implemented**: unlike Telegram, WeChat
   shows no command menu when you type `/` — a slash command is just
   plain text with no discovery entry point. The bot is an LLM, so
