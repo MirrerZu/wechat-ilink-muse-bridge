@@ -91,6 +91,8 @@
 - **两把锁分工不同**：`ilink-watch.lock` 防 hook 自己重叠，`ilink-driver.lock` 防 hook 与 daemon 互抢；两个驱动必须指向同一个状态目录，锁才共享。
 
 脚本里的路径已参数化（`ILINK_DATA_DIR`、`ILINK_HOOK_STATE_DIR`、`ILINK_CLIENT`；
-状态目录旧变量名 `ILINK_HOOK_STATE` 仍兼容，默认值与 `ilink.py health` 一致），
+状态目录旧变量名 `ILINK_HOOK_STATE` 仍兼容，默认值与 `ilink.py health` 一致）。
+hook 定义没有环境变量字段时，把这些值（桥跑在 venv 里时再加 venv 的 `PATH`）
+写成 `export` 行放进脚本旁的 `ilink-hook.env`：两个脚本都先读它，升级不会覆盖它。
 `$HATCH_HOOK_RUNTIME` 是 Muse hook 运行时提供的环境，非 Muse 环境请用
 仓库根目录的 `daemon.py`。

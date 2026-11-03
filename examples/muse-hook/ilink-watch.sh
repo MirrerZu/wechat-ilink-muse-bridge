@@ -44,6 +44,15 @@
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
+# 部署自己的值（ILINK_DATA_DIR、ILINK_CLIENT、带 cryptography 的 venv 的
+# PATH）写进脚本旁的 ilink-hook.env：hook 定义没有环境变量字段时只能靠它，
+# 升级只换脚本、不碰它。文件里只放 export 行，先于下面的默认值生效。
+HOOK_ENV=${ILINK_HOOK_ENV:-$(dirname "${BASH_SOURCE[0]}")/ilink-hook.env}
+if [ -f "$HOOK_ENV" ]; then
+  # shellcheck source=/dev/null
+  source "$HOOK_ENV"
+fi
+
 # Paths are parameterized for this public example. In production these point
 # at the bridge's data dir and the hook state dir.
 BRIDGE=${ILINK_DATA_DIR:-$HOME/wechat-ilink-data}

@@ -10,3 +10,6 @@ rescan_notified
 __pycache__/
 *.pyc
 .venv/
+
+# 部署自己的 hook 路径（examples/muse-hook/ilink-hook.env），不进仓库
+ilink-hook.env

@@ -28,8 +28,15 @@
 # Env: ILINK_HOOK_STATE_DIR (legacy alias ILINK_HOOK_STATE),
 #      ILINK_DATA_DIR and ILINK_CLIENT (as for the watch script),
 #      ILINK_WARM_IDLE (default 180), ILINK_WARM_TOTAL (default 1800),
-#      ILINK_WARM_POLL (default 1).
+#      ILINK_WARM_POLL (default 1). Like the watch script, it first reads
+#      ilink-hook.env next to itself (or ILINK_HOOK_ENV), if present.
 set -uo pipefail
+
+HOOK_ENV=${ILINK_HOOK_ENV:-$(dirname "${BASH_SOURCE[0]}")/ilink-hook.env}
+if [ -f "$HOOK_ENV" ]; then
+  # shellcheck source=/dev/null
+  source "$HOOK_ENV"
+fi
 
 STATE_DIR=${ILINK_HOOK_STATE_DIR:-${ILINK_HOOK_STATE:-$HOME/hooks/state}}
 WARM=$STATE_DIR/ilink-warm.json

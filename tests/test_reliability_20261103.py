@@ -23,6 +23,8 @@ Hook (examples/muse-hook/ilink-watch.sh, against a fake ilink.py):
     returns and carries poll_secs and, given a send time, lag_secs
   * a warm marker raised by release keeps a follow-up with that
     worker; one past its session cap does not
+  * ilink-hook.env next to the script sets the deployment's paths
+    (for hook definitions without an environment field)
 
 ilink.py:
   * poll: a non -14 business error is POLL_ERROR, not an empty batch
@@ -313,6 +315,17 @@ class HookWakeTest(unittest.TestCase):
         with open(self.p("ilink-warm.json")) as f:
             self.assertEqual(json.load(f)["since"], old)
         calls = self.run_hook(BATCH)
+        self.assertEqual(len(self.wakes(calls)), 1, calls)
+
+    def test_env_file_next_to_the_script_sets_the_paths(self):
+        # A hook definition with no environment field: the deployment's
+        # paths live in ilink-hook.env beside the script, which an
+        # upgrade never replaces.
+        with open(os.path.join(self.dir, "ilink-hook.env"), "w") as f:
+            f.write(f"export ILINK_DATA_DIR={self.bridge}\n")
+        wrong = os.path.join(self.dir, "repo-default")
+        calls = self.run_hook(BATCH, extra_env={"ILINK_DATA_DIR": wrong})
+        self.assertIn("ILINK poll", calls)
         self.assertEqual(len(self.wakes(calls)), 1, calls)
 
 

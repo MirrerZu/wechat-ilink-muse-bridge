@@ -17,6 +17,7 @@ watch script checks. Its exits are pinned:
 
 CLAIM_BUSY keeps it waiting without claiming again for a while;
 CLAIM_EMPTY keeps it waiting.
+ilink-hook.env next to the script is read before the defaults.
 
     python3 -m unittest discover -s tests -v
 """
@@ -52,9 +53,10 @@ class WarmWaitTest(unittest.TestCase):
                          "ILINK_CLIENT": os.path.join(self.state, "absent.py"),
                          "ILINK_WARM_IDLE": "2", "ILINK_WARM_POLL": "1",
                          "ILINK_WARM_TOTAL": "1800"})
+        self.helper = HELPER
 
     def run_helper(self, timeout=15):
-        return subprocess.run(["bash", HELPER], env=self.env,
+        return subprocess.run(["bash", self.helper], env=self.env,
                               capture_output=True, text=True,
                               timeout=timeout)
 
@@ -75,7 +77,7 @@ class WarmWaitTest(unittest.TestCase):
         # a real window of N-1..N seconds. With 2, a start late in a second
         # timed out at ~1.0s, before the batch below lands at 1.2s.
         self.env["ILINK_WARM_IDLE"] = "5"
-        proc = subprocess.Popen(["bash", HELPER], env=self.env,
+        proc = subprocess.Popen(["bash", self.helper], env=self.env,
                                 stdout=subprocess.PIPE, text=True)
         time.sleep(1.2)
         with open(os.path.join(self.state, "ilink-pending.json"), "w") as f:
@@ -109,6 +111,16 @@ class WarmWaitTest(unittest.TestCase):
         with open(os.path.join(self.state, "ilink-processing.json")) as f:
             self.assertEqual(json.load(f)["lease"], batch["lease"])
         self.assertIsNotNone(self.marker())
+
+    def test_env_file_next_to_the_script_is_read(self):
+        scripts = os.path.join(self.state, "scripts")
+        os.makedirs(scripts)
+        self.helper = os.path.join(scripts, "ilink-warm-wait.sh")
+        shutil.copy(HELPER, self.helper)
+        with open(os.path.join(scripts, "ilink-hook.env"), "w") as f:
+            f.write(f"export ILINK_CLIENT={REAL_CLIENT}\n")
+        out = self.land_batch_while_waiting().splitlines()
+        self.assertTrue(out[0].startswith("CLAIM_OK "), out)
 
     def test_no_client_falls_back_to_new_messages(self):
         out = self.land_batch_while_waiting()

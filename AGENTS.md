@@ -83,11 +83,23 @@ setup), read `examples/muse-hook/README.md` first, then set the hook up:
    `ilink.py` inside it) do not match `ilink.py`'s `./data/`. The state
    dir defaults to `~/hooks/state`; if you change it with
    `ILINK_HOOK_STATE_DIR`, give `ilink.py` the same value.
+   When the hook definition has no environment field, or the bridge
+   runs from a venv (the hook's `python3` must import `cryptography`),
+   put these values as `export` lines in `ilink-hook.env` next to the
+   scripts. Both scripts source it before their defaults, and an
+   upgrade never replaces it:
+
+   ```bash
+   export ILINK_DATA_DIR=/abs/path/to/data
+   export ILINK_CLIENT=/abs/path/to/ilink.py
+   export PATH=/abs/path/to/venv/bin:$PATH
+   ```
 3. Worker prompt: paste the code block of
    `examples/muse-hook/worker-prompt.md` into the hook definition in
    whole, placeholders filled in.
 4. Cron, with the same environment: `ilink.py watchdog` every 15
-   minutes (see step 4).
+   minutes (see step 4). With the env file, that is `.
+   <scripts dir>/ilink-hook.env && python3 "$ILINK_CLIENT" watchdog`.
 
 The script persists each batch to a pending queue before waking you,
 and you claim it with `ilink.py claim`. When woken, handle the batch
@@ -370,13 +382,18 @@ Steps:
      `ilink.py` and both deployed hook scripts. Save the current
      worker prompt from the hook definition to a file as well.
    - Check the new files before they go live: `python3 -m py_compile
-     ilink.py`, `bash -n` on both scripts. Compare the path lines at
-     the top of the live scripts (`BRIDGE=`, `STATE_DIR=`) with the
-     new ones: if the deployment edited them instead of setting
-     `ILINK_DATA_DIR` / `ILINK_CLIENT` in the hook's environment, move
-     those values into the environment now — the new copies carry the
-     repo defaults, and a hook pointed at the wrong data dir polls
-     nothing.
+     ilink.py`, `bash -n` on both scripts. Compare the top of the
+     live scripts with the new ones: if the deployment edited the path
+     lines (`BRIDGE=`, `STATE_DIR=`) or added a header of its own
+     (exports of `PATH`, `ILINK_DATA_DIR`, `ILINK_CLIENT`), move those
+     values into the hook's environment or, when the hook definition
+     has none, into `ilink-hook.env` next to the scripts (step 2 of
+     "2. Choose a driver"). The new copies carry the repo defaults, and
+     a hook pointed at the wrong data dir polls nothing. Check the env
+     file as the hook will see it: `bash -c '. <scripts
+     dir>/ilink-hook.env && python3 -c "import cryptography" &&
+     python3 "$ILINK_CLIENT" health --offline'`. A header that does
+     more than set variables is not covered here: stop and report it.
    - Install each file by copying it to a temp name in the target
      directory, then `mv` over the live one, so no half-copied file is
      ever in place. If the deployment keeps a copy of `AGENTS.md` and
