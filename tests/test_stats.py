@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Tests for ilink.py's stats offline snapshot.
 
-Stats reads local files only (no server calls): today's chatlog
-exchanges and send-audit outcomes (local-midnight boundary),
-send-ledger size, quote-cache size, media dir usage, session age,
-and queue backlog (same strict queue rule as health). A missing file
-is a zero, never a failure — exit code is always 0.
+Stats reads local files only (no server calls): today's hook
+traffic, pickup lag and claim wait from ilink-events.jsonl,
+send-audit outcomes (local-midnight boundary), send-ledger size,
+quote-cache size, media dir usage, session age, and queue backlog
+(same strict queue rule as health). A missing file is a zero, never
+a failure — exit code is always 0.
 
 Run from the repo root:
 
@@ -66,13 +67,25 @@ class StatsTests(unittest.TestCase):
         with open(os.path.join(DATA_DIR, name), "w") as f:
             f.write(content)
 
+    def _write_events(self, events, extra=""):
+        with open(os.path.join(STATE_DIR, "ilink-events.jsonl"), "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in events) + extra)
+
     def test_full_snapshot(self):
-        today = time.strftime("%Y-%m-%d", time.localtime())
         now = int(time.time())
-        self._write("chatlog.md",
-                    f"[{today} 10:00] 用户：hi\n"
-                    f"[{today} 10:01] 我：hello\n"
-                    "[2000-01-01 10:00] 用户：ancient\n")
+        self._write_events([
+            {"ts": now, "event": "arrive", "source": "hook", "count": 2,
+             "poll_secs": 1, "lag_secs": 20},
+            {"ts": now, "event": "wake", "source": "hook", "count": 2},
+            {"ts": now, "event": "claim", "source": "claim", "count": 2,
+             "oldest_wait_secs": 90},
+            {"ts": now, "event": "release", "source": "claim", "count": 2},
+            {"ts": now, "event": "arrive", "source": "hook", "count": 1},
+            {"ts": now, "event": "claim", "source": "claim", "count": 1,
+             "oldest_wait_secs": 10},
+            {"ts": 1000000000, "event": "arrive", "source": "hook",
+             "count": 5},
+        ])
         audit = [
             {"ts": now, "result": "ok"},
             {"ts": now, "result": "ok"},
@@ -96,7 +109,10 @@ class StatsTests(unittest.TestCase):
             json.dump({"msgs": [{}, {}]}, f)
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        self.assertIn("STATS chatlog today: 1 user / 1 bot lines", out)
+        self.assertIn("STATS hook today: 3 msg(s) arrived, 1 wake(s), "
+                      "2 claim(s), 1 release(s)", out)
+        self.assertIn("STATS pickup lag today: median 20s, max 20s", out)
+        self.assertIn("STATS claim wait today: median 50s, max 90s", out)
         self.assertIn("STATS sends today: 2 ok / 1 failed", out)
         self.assertIn("STATS ledger: 2 entries", out)
         self.assertIn("STATS quote cache: 2 entries, 1 svr mappings", out)
@@ -111,10 +127,30 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("STATS queue: pending CORRUPT", out)
 
+    def test_corrupt_event_lines_skipped(self):
+        now = int(time.time())
+        self._write_events(
+            [{"ts": now, "event": "arrive", "count": 1},
+             {"ts": now, "event": "claim", "oldest_wait_secs": "soon"},
+             ["not", "an", "object"]],
+            extra="{truncated\n")
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertIn("STATS hook today: 1 msg(s) arrived", out)
+
+    def test_events_without_claims(self):
+        self._write_events([{"ts": int(time.time()), "event": "arrive",
+                             "count": 1}])
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertIn("STATS pickup lag today: none", out)
+        self.assertIn("STATS claim wait today: none", out)
+
     def test_missing_everything_is_zeros(self):
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        self.assertIn("STATS chatlog today: 0 user / 0 bot lines", out)
+        self.assertIn("STATS hook today: no events file (hook driver only)",
+                      out)
         self.assertIn("STATS sends today: 0 ok / 0 failed", out)
         self.assertIn("STATS ledger: 0 entries", out)
         self.assertIn("STATS quote cache: 0 entries, 0 svr mappings", out)

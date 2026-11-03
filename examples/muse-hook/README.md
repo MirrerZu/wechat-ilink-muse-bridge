@@ -35,8 +35,11 @@
   积压一个多小时。
 - **不重复回复**：认领用 `ilink.py claim`（加锁，与本脚本共用
   `ilink-queue.lock`），第二个 worker 拿到 `CLAIM_BUSY`，不读任何
-  上下文就退出。发送前复查用 `claim --lease <租约>`，把新到的 pending
-  并进自己的认领、别人就不会再回一遍；回复发完 `release <租约>` 放下。
+  上下文就退出。冷启动的 worker 用 `claim --recent --with <今天的日志>`
+  一次拿齐批次、最近 24 小时往来原文（取自引用缓存）和日志末尾，第一轮
+  就能写回复。发送前复查由第一个气泡的 `send --lease <租约>` 顺带完成，
+  把新到的 pending 并进自己的认领、别人就不会再回一遍（有新消息时不发、
+  返回 `SEND_DEFERRED`）；回复发完 `release <租约>` 放下。
   处理期间约每 60 秒 `renew <租约>` 续租：超过 10 分钟没续租的认领会被
   下一个 worker 接管。不要再用 `mv` 认领——它会覆盖别人的认领。
 - **发送幂等键**：回复某批次时，把该批次首条消息的 `message_id`
@@ -52,10 +55,13 @@
   typing 指示，不等 worker 冷启动；worker 侧的点亮只作续期。
 - **回复后守候（连聊免冷启动）**：worker 回复完不立刻退出，而是运行
   `ilink-warm-wait.sh` 守候（默认空闲 180 秒、连聊总上限 1800 秒）：它
-  维护热态标记 `ilink-warm.json`（心跳），守候期内新消息由它第一时间
-  发现、worker 跳过上下文重读直接回复；脚本侧看到心跳新鲜的标记就不
-  再重复 wake。标记心跳过期（worker 已死）脚本自动恢复正常 wake，
-  自愈。空闲满 180 秒无人说话，worker 才安静退出。
+  维护热态标记 `ilink-warm.json`（心跳），每秒看一次队列，新消息一到就
+  替 worker 认领、把批次直接交给它，worker 不再为认领多想一轮，也跳过
+  上下文重读直接回复；脚本侧看到心跳新鲜的标记就不再重复 wake。回复
+  一发出（`send --lease`）、放下批次时（`release`）就先立起这个标记，worker
+  写日志、还没进守候的那十来秒里主人追问，也交给它，不再叫第二个冷
+  启动 worker。标记心跳过期（worker 已死，45 秒）脚本自动恢复正常
+  wake，自愈。空闲满 180 秒无人说话，worker 才安静退出。
 - **token 过期只通知一次**：脚本发现 `TOKEN_EXPIRED` 时创建
   `rescan_notified` 标记并唤醒 agent 通知用户重扫；标记在就不再打扰。
 - **告警闭环**（`alert-state.json` 状态机）：过期超过 1 小时每小时复报
@@ -77,6 +83,9 @@
   "没有新消息"）。
 - **事件流水**：wake、认领、合并、放下逐条记进 `ilink-events.jsonl`
   （只有 id、条数和时间，不记正文），一批消息从到达到放下全程可查。
+  到达（arrive）按 poll 返回的时刻记，带 `poll_secs`（这次长轮询
+  hold 了多久）和 `lag_secs`（最早一条从主人发出到落盘过了多久）；
+  `ilink.py stats` 汇总当天的收件延迟和认领等待。
 
 - **共享驱动锁**：本脚本每轮在单实例锁之外，还会非阻塞尝试状态目录下的 `ilink-driver.lock`；拿不到说明 `daemon.py` 在跑，本轮安静退出（不 touch 心跳、不 poll、不 wake）。反过来，`daemon.py` 启动时若本脚本的心跳新鲜也会拒绝启动。先跑起来的驱动赢，后到的让路——“hook 与 daemon 二选一”不再只是一句文档。
 - **两把锁分工不同**：`ilink-watch.lock` 防 hook 自己重叠，`ilink-driver.lock` 防 hook 与 daemon 互抢；两个驱动必须指向同一个状态目录，锁才共享。

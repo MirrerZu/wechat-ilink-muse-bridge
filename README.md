@@ -87,8 +87,7 @@ Muse 的主聊天里说一句"把待批名单里的加进白名单"，它会把�
   维护标记即可静音
 - **运维命令** — `rollback`（从最新 .bak-* 备份恢复）、`stats`（纯本地
   快照，不调服务端）、`preflight`（登录前环境预检）、`smoke-test`
-  （端到端冒烟自检）、`prune-media`（媒体保留清理）、`rotate-chatlog`
-  （往月对话记录归档），详见下方速查表
+  （端到端冒烟自检）、`prune-media`（媒体保留清理），详见下方速查表
 - **打磨拟人化的回复** — 回复先像人打字：长句拆成短句，先给结论
   再说细节，说大白话、不用模板套话；内容自然分段时拆成 2~3 个短
   气泡（先接一句、再说正事、最后问一句），不把一句话硬切成两半；
@@ -211,9 +210,8 @@ python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文�
 python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视频
 python3 ilink.py rollback [--hook-dir <dir>]           # 从最新 .bak-* 备份恢复
 python3 ilink.py watchdog [--max-age-mins N]           # hook 心跳看门狗（默认 30 分钟）
-python3 ilink.py stats                                 # 本地快照（不调服务端）
+python3 ilink.py stats                                 # 本地快照：今日收件/认领等待/发送（不调服务端）
 python3 ilink.py preflight                             # 登录前环境预检
-python3 ilink.py rotate-chatlog                        # 往月对话记录归档
 python3 ilink.py prune-media [--dry-run]               # 媒体保留清理（默认 30 天 + 500MB）
 python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
 ```

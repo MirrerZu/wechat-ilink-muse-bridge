@@ -19,12 +19,16 @@ Hook (examples/muse-hook/ilink-watch.sh, against a fake ilink.py):
   * typing runs in the background and never delays the wake
   * a heartbeat gap is reported once as hook_gap (not while the
     maintenance flag is set)
-  * wakes land in ilink-events.jsonl
+  * wakes land in ilink-events.jsonl; arrive is stamped when the poll
+    returns and carries poll_secs and, given a send time, lag_secs
+  * a warm marker raised by release keeps a follow-up with that
+    worker; one past its session cap does not
 
 ilink.py:
   * poll: a non -14 business error is POLL_ERROR, not an empty batch
   * poll: create_time_ms reaches the queue entry
-  * claim / renew / release: busy, merge, takeover, lost, stray files
+  * claim / renew / release: busy, merge, takeover, lost, stray files;
+    release raises the warm marker, continuing the session's `since`
   * send: network errors retry with backoff on one client_id
   * health: an old unclaimed batch and stray claim files are warnings
 
@@ -65,6 +69,7 @@ if cmd == "typing":
 with open(trace, "a") as f:
     f.write("ILINK " + " ".join(sys.argv[1:]) + "\n")
 if cmd == "poll":
+    time.sleep(float(os.environ.get("FAKE_POLL_DELAY", "0")))
     print(os.environ.get("FAKE_OUT", ""))
 elif cmd == "commit":
     sys.stdin.read()
@@ -265,6 +270,51 @@ class HookWakeTest(unittest.TestCase):
         self.assertEqual(events[1]["sig"], "7")
         self.assertNotIn("hi", json.dumps(events))  # never message text
 
+    def arrive_event(self):
+        with open(self.p("ilink-events.jsonl")) as f:
+            events = [json.loads(ln) for ln in f]
+        return next(e for e in events if e["event"] == "arrive")
+
+    def test_arrive_records_pickup_lag_when_the_poll_returns(self):
+        # Production 2026-11-03: arrive was stamped with the round's
+        # start time, before a long poll that can hold for 35 seconds.
+        batch = json.loads(BATCH)
+        batch["msgs"][0]["create_time_ms"] = (int(time.time()) - 20) * 1000
+        start = int(time.time())
+        self.run_hook(json.dumps(batch), extra_env={"FAKE_POLL_DELAY": "2"})
+        arrive = self.arrive_event()
+        self.assertGreaterEqual(arrive["ts"], start + 2)
+        self.assertGreaterEqual(arrive["poll_secs"], 2)
+        self.assertGreaterEqual(arrive["lag_secs"], 22)
+        self.assertLess(arrive["lag_secs"], 40)
+
+    def test_arrive_without_send_time_has_no_lag(self):
+        self.run_hook(BATCH)
+        arrive = self.arrive_event()
+        self.assertIn("poll_secs", arrive)
+        self.assertNotIn("lag_secs", arrive)
+
+    def test_release_marker_keeps_followup_with_its_worker(self):
+        # Production 2026-11-03: ~12 seconds between the reply going
+        # out and the warm wait starting, with no claim open and no
+        # marker up — a quick follow-up woke a second, cold worker.
+        with mock.patch.dict(os.environ, {"ILINK_HOOK_STATE_DIR": self.state}):
+            ilink._raise_warm_marker(int(time.time()))
+        calls = self.run_hook(BATCH)
+        self.assertEqual(self.wakes(calls), [])
+        self.assertIn("warm worker on duty", calls)
+
+    def test_release_marker_past_session_cap_still_wakes(self):
+        old = int(time.time()) - 2000
+        self.write("ilink-warm.json", {"since": old, "activity": old,
+                                       "heartbeat": old, "until": old + 1800})
+        with mock.patch.dict(os.environ, {"ILINK_HOOK_STATE_DIR": self.state}):
+            ilink._raise_warm_marker(int(time.time()))
+        with open(self.p("ilink-warm.json")) as f:
+            self.assertEqual(json.load(f)["since"], old)
+        calls = self.run_hook(BATCH)
+        self.assertEqual(len(self.wakes(calls)), 1, calls)
+
 
 class IlinkBase(unittest.TestCase):
     def setUp(self):
@@ -459,6 +509,40 @@ class ClaimTest(IlinkBase):
         self.assertFalse(os.path.exists(self.p("ilink-processing.json")))
         self.assertEqual(self.run_cmd(ilink.cmd_release, lease),
                          (0, ["RELEASE_GONE"]))
+
+    def test_release_raises_the_warm_marker(self):
+        self.write("ilink-pending.json", _msgs(1))
+        _, status, _ = self.claim()
+        before = int(time.time())
+        with mock.patch.dict(os.environ, {"ILINK_WARM_TOTAL": "900"}):
+            self.run_cmd(ilink.cmd_release, status.split()[1])
+        marker = self.read("ilink-warm.json")
+        self.assertGreaterEqual(marker["heartbeat"], before)
+        self.assertEqual(marker["since"], marker["heartbeat"])
+        self.assertEqual(marker["until"], marker["since"] + 900)
+
+    def test_release_continues_the_warm_session(self):
+        since = int(time.time()) - 600
+        self.write("ilink-warm.json", {"since": since, "activity": since,
+                                       "heartbeat": since,
+                                       "until": since + 1800})
+        self.write("ilink-pending.json", _msgs(1))
+        _, status, _ = self.claim()
+        self.run_cmd(ilink.cmd_release, status.split()[1])
+        marker = self.read("ilink-warm.json")
+        self.assertEqual(marker["since"], since)
+        self.assertGreaterEqual(marker["heartbeat"], since + 600)
+
+    def test_lost_or_gone_release_raises_no_marker(self):
+        self.write("ilink-pending.json", _msgs(1))
+        _, status, _ = self.claim()
+        self.assertEqual(self.run_cmd(ilink.cmd_release, "not-mine")[0], 1)
+        self.assertFalse(os.path.exists(self.p("ilink-warm.json")))
+        self.run_cmd(ilink.cmd_release, status.split()[1])
+        os.remove(self.p("ilink-warm.json"))
+        self.assertEqual(self.run_cmd(ilink.cmd_release, status.split()[1]),
+                         (0, ["RELEASE_GONE"]))
+        self.assertFalse(os.path.exists(self.p("ilink-warm.json")))
 
     def test_event_log_has_lifecycle_without_text(self):
         self.write("ilink-pending.json", _msgs(1))

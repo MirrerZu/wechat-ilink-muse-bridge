@@ -42,9 +42,14 @@ WeChat user ──message──> iLink server
 - **No duplicate replies**: the worker claims with `ilink.py claim`
   (locked, shared with this script through `ilink-queue.lock`): a
   second worker gets `CLAIM_BUSY` and exits before reading any
-  context. The pre-send re-check is `claim --lease <lease>`, which
-  moves new pending messages INTO the claim, so no one else answers
-  them; `release <lease>` lets go once the reply is sent. Never `mv`:
+  context. A cold worker claims with `claim --recent --with <today's
+  diary>`: the batch, the last 24 hours of exchanges verbatim (from
+  the quote cache) and the diary tail in one call, so its first model
+  round can already write the reply. The pre-send re-check rides on
+  the first bubble's `send --lease <lease>`, which moves new pending
+  messages INTO the claim, so no one else answers them (with anything
+  new it sends nothing and prints `SEND_DEFERRED`); `release <lease>`
+  lets go once the reply is sent. Never `mv`:
   it overwrites another worker's claim.
 - **Burst merging**: when a user fires off several messages, iLink splits
   them into multiple responses. The worker does not wait a fixed interval;
@@ -60,9 +65,16 @@ WeChat user ──message──> iLink server
   worker runs `ilink-warm-wait.sh` (default 180s idle window, 30-minute
   session cap) instead of exiting. The waiter heartbeats a warm marker
   (`ilink-warm.json`); while it is fresh the script lands new batches
-  without waking a second worker, and the warm worker claims them
-  within seconds and replies without re-reading context. A stale
-  heartbeat (dead worker) re-arms normal waking automatically.
+  without waking a second worker. The waiter checks the queue every
+  second and claims a new batch for the worker, handing it over in
+  its output, so the worker spends no model round on claiming and
+  replies without re-reading context. The reply going out
+  (`send --lease`) and `ilink.py release` already raise the marker, so
+  a follow-up landing
+  in the ten-odd seconds while the worker writes its diary, before the
+  wait starts, goes to it too instead of waking a second, cold worker.
+  A stale heartbeat (dead worker, 45 seconds) re-arms normal waking
+  automatically.
 - **Token expiry nags once**: when the script sees `TOKEN_EXPIRED` it
   creates a `rescan_notified` marker and wakes the agent to ask the user
   to re-scan; while the marker exists, it never nags again.
@@ -93,7 +105,11 @@ WeChat user ──message──> iLink server
   masquerading as "no new messages").
 - **Event log**: wakes, claims, merges and releases append to
   `ilink-events.jsonl` (ids, counts, timings, never text), so one
-  batch can be followed from arrival to release.
+  batch can be followed from arrival to release. An arrival is stamped
+  when the poll returns and carries `poll_secs` (how long that long
+  poll was held) and `lag_secs` (from the owner sending the oldest
+  message to it being queued); `ilink.py stats` sums up today's pickup
+  lag and claim wait.
 
 Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE_DIR`,
 `ILINK_CLIENT`; the legacy state-dir name `ILINK_HOOK_STATE` still works, and

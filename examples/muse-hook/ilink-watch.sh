@@ -370,7 +370,11 @@ else
   # 是纯拉取（不推进游标、不记去重），超时只是本轮无结果、下轮重拉，
   # 但能防止病态媒体批次把队列拖住数十分钟（单实例锁会让后续轮次
   # 安静退出，队列实际停滞）。
+  poll_t0=$(date +%s)
   out=$(timeout 120 python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
+  # NOW 是本轮开头取的，长轮询可能已 hold 了 35 秒：之后的事件时间、
+  # 热态心跳判断和告警计时都按 poll 返回的时刻算
+  NOW=$(date +%s)
 
   if [[ "$out" == TOKEN_STALE* ]]; then
     # -14 退避窗口内：token 可能自愈，不告警、不记 poll 故障，下轮再看
@@ -483,7 +487,18 @@ else
         rec_extra=""
         if [ -n "$recovered" ]; then rec_extra=",\"recovered\":$recovered"; fi
         sig=$(batch_sig "$PENDING")
-        hook_event arrive "{\"sig\":\"$sig\",\"count\":$cnt}"
+        # 收件延迟：poll_secs 是这次长轮询 hold 了多久，lag_secs 是最早
+        # 一条从主人发出到落盘过了多久。lag 远大于 poll 说明消息在本轮
+        # 开始前就在服务端等着：各轮首尾相接，多半是上一轮长轮询没把它
+        # 带回来；两者都大且接近，说明本轮服务端有消息也没提前返回。
+        # create_time_ms 用的是服务端时钟，实测比本机快 1~2 秒
+        lag=$(printf '%s' "$out" | jq --argjson now "$NOW" \
+          '[.msgs[]?.create_time_ms | numbers | select(. > 0)]
+           | if length > 0 then [$now - (min / 1000 | floor), 0] | max else empty end' \
+          2>/dev/null || true)
+        lag_field=""
+        case "$lag" in ''|*[!0-9]*) ;; *) lag_field=",\"lag_secs\":$lag" ;; esac
+        hook_event arrive "{\"sig\":\"$sig\",\"count\":$cnt,\"poll_secs\":$((NOW - poll_t0))$lag_field}"
         if [ -z "$recovered" ] && warm_alive; then
           # 守候中的 worker 会在数秒内自己认领；带 recovered 时照常 wake，
           # 免得恢复通知被吞掉（多叫的 worker 由 claim 返回 CLAIM_BUSY 退出）

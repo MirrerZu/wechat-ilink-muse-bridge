@@ -113,8 +113,7 @@ keeps a stranger from talking their way onto the allowlist.
 - **Ops commands** — `rollback` (restore from the newest .bak-*
   backup), `stats` (offline snapshot, no server calls), `preflight`
   (pre-login environment check), `smoke-test` (end-to-end self-check),
-  `prune-media` (media retention cleanup), `rotate-chatlog` (monthly
-  chatlog archiving); see the cheat sheet below
+  `prune-media` (media retention cleanup); see the cheat sheet below
 - **Human-like replies, polished** — replies read like a human texting:
   long sentences are broken into short ones, conclusion first, then
   detail, in plain words with no template phrasing; content that
@@ -261,9 +260,8 @@ python3 ilink.py proactive-file <user_id> <file>        # proactively push a fil
 python3 ilink.py proactive-video <user_id> <video>      # proactively push a video
 python3 ilink.py rollback [--hook-dir <dir>]           # restore from the newest .bak-* backup
 python3 ilink.py watchdog [--max-age-mins N]           # hook heartbeat watchdog (default 30 minutes)
-python3 ilink.py stats                                 # offline snapshot (no server calls)
+python3 ilink.py stats                                 # offline snapshot: today's arrivals/claim wait/sends (no server calls)
 python3 ilink.py preflight                             # pre-login environment check
-python3 ilink.py rotate-chatlog                        # archive past-month chatlog lines
 python3 ilink.py prune-media [--dry-run]               # media retention cleanup (default 30 days + 500MB)
 python3 ilink.py smoke-test [--no-send]                # end-to-end self-check
 ```

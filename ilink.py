@@ -8,24 +8,24 @@ Usage:
   ilink.py bind [seconds]      # one 10-min owner-binding window (first sender wins + welcome)
   ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
   ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
-  ilink.py claim [--lease <l>] # worker: take the pending batch (CLAIM_OK <lease> + JSON / CLAIM_BUSY / CLAIM_EMPTY); with --lease merge new pending into your batch
+  ilink.py claim [--lease <l>] [--recent] [--with <file>...]  # worker: take the pending batch (CLAIM_OK <lease> + JSON / CLAIM_BUSY / CLAIM_EMPTY); --recent adds the last 24h of exchanges, --with appends file tails, both on CLAIM_OK only; with --lease merge new pending into your batch
   ilink.py renew <lease>       # worker: keep the claim alive (~every 60s while working)
   ilink.py release <lease>     # worker: let go of the batch once the whole reply is sent
-  ilink.py send <to> <ctx> <text> [--key <id>]  # send text reply (use - for stdin)
+  ilink.py send <to> <ctx> <text> [--key <id>] [--lease <l>]  # send text reply (use - for stdin); --lease re-checks pending first (SEND_DEFERRED <n> + batch, exit 3, sends nothing)
   ilink.py proactive <to> <text> [--key <id>]   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
-  ilink.py send-image <to> <ctx> <path> [--key <id>]   # reply with an image
-  ilink.py send-file <to> <ctx> <path> [--key <id>]    # reply with a file
-  ilink.py send-video <to> <ctx> <path> [--key <id>]   # reply with a video
+  ilink.py send-image <to> <ctx> <path> [--key <id>] [--lease <l>]   # reply with an image
+  ilink.py send-file <to> <ctx> <path> [--key <id>] [--lease <l>]    # reply with a file
+  ilink.py send-video <to> <ctx> <path> [--key <id>] [--lease <l>]   # reply with a video
   ilink.py send-voice <to> <ctx> <path> <playtime_ms>   # voice msg (SILK@24k; NOTE: channel silently drops outbound voice)
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
   ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
   ilink.py smoke-test [--no-send] [--to <owner>]  # end-to-end chain check: login probe, receive readiness, real text+image to owner, ledger (exit 0 ok / 1 fail)
   ilink.py watchdog [--max-age-mins N]  # dead-man's switch: hook heartbeat freshness (exit 0 fresh/recovered/disabled, 1 stale)
-  ilink.py rotate-chatlog  # archive past-month chatlog.md lines into chatlog-YYYY-MM.md (exit 0)
+  ilink.py rotate-chatlog  # legacy: archive past-month chatlog.md lines (only for prompts that still write it; exit 0)
   ilink.py rollback [--hook-dir <dir>]  # restore ilink.py (+ hook scripts) from newest .bak-* backup (exit 0 ok / 1 fail)
-  ilink.py stats  # offline snapshot: today's exchanges/sends, ledger, quote cache, media, session, queue (exit 0)
+  ilink.py stats  # offline snapshot: today's hook traffic + pickup lag + claim wait, sends, ledger, quote cache, media, session, queue (exit 0)
   ilink.py preflight  # pre-login env check: Python, cryptography, network, writable dirs (exit 0 ok / 1 fail)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
   ilink.py proactive-voice <to> <path> <playtime_ms>   # proactive voice (dropped by channel, see send-voice)
@@ -1258,6 +1258,10 @@ def cmd_poll():
                 pending_entries[str(m["message_id"])] = {
                     "text": "\n".join(parts), "kind": kinds[0],
                     "from": "bot", "at": int(time.time())}
+                if m.get("create_time_ms"):
+                    # The bot's own send time: claim --recent orders by it
+                    pending_entries[str(m["message_id"])]["create_time_ms"] = \
+                        m["create_time_ms"]
             continue
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
@@ -1366,6 +1370,11 @@ def cmd_poll():
             cache_entry = {"text": "\n".join(cache_parts),
                            "kind": cache_kinds[0] if cache_kinds else "text",
                            "from": "user", "at": int(time.time())}
+            sent_ms = m.get("create_time_ms") or next(
+                (it.get("create_time_ms") for it in m.get("item_list") or []
+                 if it.get("create_time_ms")), None)
+            if sent_ms:
+                cache_entry["create_time_ms"] = sent_ms
             if cache_media_path:
                 cache_entry["media_path"] = cache_media_path
             pending_entries[str(m["message_id"])] = cache_entry
@@ -2752,6 +2761,11 @@ def cmd_watchdog(max_age_mins=WATCHDOG_MAX_AGE_MINS):
 # over and must stop.
 CLAIM_STALE_SECS = 600  # same 10 minutes as the hook's `-cmin +10` recycle
 CLAIM_EVENTS_CAP = 2000  # ilink-events.jsonl lines kept
+WARM_TOTAL_DEFAULT = 1800  # ilink-warm-wait.sh's ILINK_WARM_TOTAL default
+RECENT_WINDOW_SECS = 86400  # claim --recent: exchanges from the last 24 hours
+RECENT_MAX = 40  # claim --recent: newest exchanges kept
+RECENT_TEXT_MAX = 500  # claim --recent: characters kept per exchange
+CLAIM_WITH_MAX_CHARS = 8000  # claim --with: tail of each file kept
 
 
 def _claim_paths():
@@ -2895,7 +2909,7 @@ def _print_batch(status, data, now, **extra):
     print(json.dumps(view, ensure_ascii=False))
 
 
-def cmd_claim(lease=None):
+def cmd_claim(lease=None, recent=False, with_files=()):
     """Take the pending batch, or with lease merge newly pending messages
     into the batch you already hold (the pre-send re-check).
 
@@ -2905,7 +2919,11 @@ def cmd_claim(lease=None):
       CLAIM_EMPTY       nothing to do
       CLAIM_OK <lease>  then one JSON line: lease, count,
                         first_message_id (the send key), oldest_wait_secs,
-                        took_over, msgs
+                        took_over, msgs; with recent also recent_tz and
+                        recent (see _recent_exchanges); then each
+                        with_files file (see _print_context_file)
+    The context rides on CLAIM_OK only, so a cold worker gets everything
+    in one tool call and a busy one reads nothing.
     A claim that is already answered (see _batch_answered) is dropped, not
     honored. One that has not been renewed for CLAIM_STALE_SECS is taken
     over: its messages, and those of any stale ilink-processing-*.json a
@@ -2919,27 +2937,17 @@ def cmd_claim(lease=None):
                         turn (exit 1)"""
     state_dir, pend, proc = _claim_paths()
     now = int(time.time())
+    if lease:
+        merged = _merge_pending_into(lease, now)
+        if merged is None:
+            print("CLAIM_LOST")
+            return 1
+        _print_batch(f"CLAIM_MERGED {merged[1]}", merged[0], now)
+        return 0
     with _queue_lock():
         pend_data, pend_bad = _load_claim_file(pend)
         pend_msgs = pend_data["msgs"] if pend_data else []
         proc_data, proc_bad = _load_claim_file(proc)
-        if lease:
-            if not proc_data or proc_data.get("lease") != lease:
-                _claim_event("lost", lease=lease)
-                print("CLAIM_LOST")
-                return 1
-            before = len(proc_data["msgs"])
-            proc_data["msgs"] = _merge_msgs(proc_data["msgs"], pend_msgs)
-            proc_data["renewed_at"] = now
-            _atomic_write(proc, lambda f: json.dump(proc_data, f, ensure_ascii=False))
-            if pend_data is not None:
-                _unlink(pend)
-            added = len(proc_data["msgs"]) - before
-            _claim_event("merge", lease=lease, added=added,
-                         count=len(proc_data["msgs"]))
-            _print_batch(f"CLAIM_MERGED {added}", proc_data, now)
-            return 0
-
         took_over = []
         carried = []
         if proc_bad:
@@ -2995,9 +3003,118 @@ def cmd_claim(lease=None):
         wait = _oldest_wait_secs(msgs, now)
         _claim_event("claim", lease=new["lease"], count=len(msgs),
                      oldest_wait_secs=wait, took_over=took_over or None)
-        _print_batch(f"CLAIM_OK {new['lease']}", new, now,
-                     took_over=took_over)
-        return 0
+    # Context goes out after the lock: it reads other files, and nothing
+    # in it decides the claim.
+    extra = {"took_over": took_over}
+    if recent:
+        extra["recent_tz"] = time.strftime("%z")
+        extra["recent"] = _recent_exchanges(
+            {str(m.get("message_id")) for m in msgs}, now)
+    _print_batch(f"CLAIM_OK {new['lease']}", new, now, **extra)
+    for path in with_files:
+        _print_context_file(path)
+    return 0
+
+
+def _merge_pending_into(lease, now, merge=True):
+    """Move newly pending messages into the claim held under lease: the
+    pre-send re-check behind both `claim --lease` and `send --lease`.
+    Returns (batch, added), or None when the claim was taken over. With
+    merge=False only the lease is checked and the claim renewed."""
+    _, pend, proc = _claim_paths()
+    with _queue_lock():
+        pend_data, _ = _load_claim_file(pend)
+        pend_msgs = pend_data["msgs"] if pend_data else []
+        proc_data, _ = _load_claim_file(proc)
+        if not proc_data or proc_data.get("lease") != lease:
+            _claim_event("lost", lease=lease)
+            return None
+        if not merge:
+            os.utime(proc)
+            return proc_data, 0
+        before = len(proc_data["msgs"])
+        proc_data["msgs"] = _merge_msgs(proc_data["msgs"], pend_msgs)
+        proc_data["renewed_at"] = now
+        _atomic_write(proc, lambda f: json.dump(proc_data, f, ensure_ascii=False))
+        if pend_data is not None:
+            _unlink(pend)
+        added = len(proc_data["msgs"]) - before
+        _claim_event("merge", lease=lease, added=added,
+                     count=len(proc_data["msgs"]))
+    return proc_data, added
+
+
+def _recent_exchanges(exclude_ids, now):
+    """The owner's messages and the bot's replies and pushes from the
+    last RECENT_WINDOW_SECS, verbatim and oldest first, minus the batch
+    itself: what a cold worker needs to pick the conversation up where
+    it left off. The quote cache already holds both sides — strangers
+    are filtered out before anything is cached — so nothing new is
+    stored. Ordered by the message's own send time when known (cache
+    write time lags it, and a bot echo lands a poll later). Never
+    raises: no cache is no context, not a failed claim."""
+    try:
+        by_id = _load_quote_cache()["by_id"]
+    except Exception:
+        return []
+    rows = []
+    for mid, e in by_id.items():
+        if mid in exclude_ids or not isinstance(e, dict):
+            continue
+        sent = e.get("create_time_ms")
+        if isinstance(sent, (int, float)) and sent > 0:
+            when = sent / 1000
+        elif isinstance(e.get("at"), (int, float)):
+            when = e["at"]
+        else:
+            continue
+        if now - when > RECENT_WINDOW_SECS:
+            continue
+        text = str(e.get("text") or "")
+        if len(text) > RECENT_TEXT_MAX:
+            text = text[:RECENT_TEXT_MAX] + "…"
+        row = {"from": "bot" if e.get("from") == "bot" else "owner",
+               "time": time.strftime("%m-%d %H:%M", time.localtime(when)),
+               "text": text}
+        if e.get("kind") not in (None, "text"):
+            row["kind"] = e["kind"]
+        if e.get("media_path"):
+            row["media_path"] = e["media_path"]
+        rows.append((when, row))
+    rows.sort(key=lambda r: r[0])
+    return [row for _, row in rows[-RECENT_MAX:]]
+
+
+def _print_context_file(path):
+    """claim --with: print one file the worker asked for after the batch,
+    so its first model round already has it. Only the last
+    CLAIM_WITH_MAX_CHARS characters, cut at a line start: these are
+    append-only diaries, and the end is the part that matters. The login
+    credential is refused whatever the worker asks for."""
+    full = os.path.expanduser(path)
+    if os.path.realpath(full) == os.path.realpath(SESSION_FILE):
+        print(f"--- FILE {path}: refused (login credential) ---")
+        return
+    try:
+        with open(full, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        print(f"--- FILE {path}: missing ---")
+        return
+    except OSError as e:
+        print(f"--- FILE {path}: unreadable ({type(e).__name__}) ---")
+        return
+    if len(text) > CLAIM_WITH_MAX_CHARS:
+        tail = text[-CLAIM_WITH_MAX_CHARS:]
+        cut = tail.find("\n")
+        if 0 <= cut < len(tail) - 1:
+            tail = tail[cut + 1:]
+        print(f"--- FILE {path} (last {len(tail)} of {len(text)} chars) ---")
+        text = tail
+    else:
+        print(f"--- FILE {path} ---")
+    print(text.rstrip("\n"))
+    print("--- END FILE ---")
 
 
 def cmd_renew(lease):
@@ -3017,11 +3134,47 @@ def cmd_renew(lease):
     return 0
 
 
+def _raise_warm_marker(now):
+    """Put up the warm marker as the reply goes out (send --lease) and
+    as the claim is released, before the worker gets to
+    ilink-warm-wait.sh. From the send on, the batch counts as answered,
+    and until the wait the worker releases and writes its diary (a model
+    round or two, ~10 seconds): a follow-up landing then found neither
+    an open claim nor a marker, so the hook woke a second, cold
+    worker. Same format and session rule as the wait
+    script, which takes the marker over: `since` carries on from an
+    existing marker, so the session cap still counts from its start
+    and a marker whose cap has passed stays inert. A worker that dies
+    before waiting leaves a heartbeat that goes stale in 45 seconds,
+    and the hook wakes as usual. Never raises."""
+    try:
+        path = os.path.join(_hook_state_dir(), "ilink-warm.json")
+        since = now
+        try:
+            with open(path) as f:
+                prev = json.load(f).get("since")
+            if isinstance(prev, int) and prev > 0:
+                since = prev
+        except (OSError, ValueError, AttributeError):
+            pass
+        try:
+            total = int(os.environ.get("ILINK_WARM_TOTAL", WARM_TOTAL_DEFAULT))
+        except ValueError:
+            total = WARM_TOTAL_DEFAULT
+        marker = {"since": since, "activity": now, "heartbeat": now,
+                  "until": since + total}
+        _atomic_write(path, lambda f: json.dump(marker, f))
+    except Exception:
+        pass
+
+
 def cmd_release(lease):
     """Let go of a batch once every bubble of its reply is sent, BEFORE
-    the warm wait. RELEASE_OK; RELEASE_GONE when there is no claim left
-    (released already); CLAIM_LOST (exit 1) when someone else holds it
-    now — leave their claim alone."""
+    the warm wait. Also raises the warm marker, so the hook leaves a
+    follow-up to this worker's wait instead of waking another.
+    RELEASE_OK; RELEASE_GONE when there is no claim left (released
+    already); CLAIM_LOST (exit 1) when someone else holds it now —
+    leave their claim alone."""
     _, _, proc = _claim_paths()
     now = int(time.time())
     with _queue_lock():
@@ -3033,6 +3186,8 @@ def cmd_release(lease):
             _claim_event("lost", lease=lease)
             print("CLAIM_LOST")
             return 1
+        # Marker first, then the claim: no instant with neither
+        _raise_warm_marker(now)
         _unlink(proc)
     held = None
     if isinstance(data.get("claimed_at"), int):
@@ -3047,11 +3202,14 @@ def cmd_rotate_chatlog():
     """Archive chatlog.md lines from past months into per-month files
     (chatlog-YYYY-MM.md), keeping current-month and undated lines in
     place. Idempotent: a second run finds nothing old and prints
-    ROTATE_NOTHING. The worker reads the last 30 lines of chatlog.md,
-    which rotation never breaks — current-month lines stay, and
-    archives are named by month for manual lookup. A missing chatlog
-    is ROTATE_NOTHING, not an error. Exit 0 on success or nothing to
-    do, 1 only on a write failure."""
+    ROTATE_NOTHING. Legacy: nothing in this repo writes chatlog.md —
+    only a deployment whose own older worker prompt still appends to
+    it needs this (the current prompt keeps its diary in the Muse
+    memory dir instead). Current-month lines stay, so a prompt reading
+    the tail of chatlog.md never breaks, and archives are named by
+    month for manual lookup. A missing chatlog is ROTATE_NOTHING, not
+    an error. Exit 0 on success or nothing to do, 1 only on a write
+    failure."""
     path = os.path.join(BRIDGE, "chatlog.md")
     try:
         with open(path) as f:
@@ -3187,30 +3345,62 @@ def cmd_rollback(hook_dir=None, script_path=None):
 
 def cmd_stats():
     """Offline snapshot from local files only (no server calls, so it
-    works while the bridge is down). Today's chatlog exchanges and
+    works while the bridge is down). Today's hook traffic from
+    ilink-events.jsonl (messages arrived, wakes, claims, releases, how
+    long a message took to reach the queue, and how long the owner had
+    waited when each batch was claimed) and
     send-audit outcomes (local-midnight boundary), send-ledger size,
     quote-cache size, media dir usage, session age, and queue backlog
-    (same strict queue rule as health). A missing file is a zero,
-    never a failure — stats is a diagnostic, so exit code is always
-    0."""
+    (same strict queue rule as health). Only code-written records are
+    counted: the worker's own diary is free-form and stays out of it.
+    A missing file is a zero, never a failure — stats is a
+    diagnostic, so exit code is always 0."""
     today = time.strftime("%Y-%m-%d", time.localtime())
     try:
         today_start = int(time.mktime(time.strptime(today, "%Y-%m-%d")))
     except Exception:
         today_start = 0
     out = ["STATS"]
-    user_n = bot_n = 0
+    arrived = wakes = claims = releases = 0
+    lags = []
+    waits = []
     try:
-        with open(os.path.join(BRIDGE, "chatlog.md")) as f:
+        with open(os.path.join(_hook_state_dir(), "ilink-events.jsonl")) as f:
             for line in f:
-                if line.startswith(f"[{today}"):
-                    if "] 用户：" in line:
-                        user_n += 1
-                    elif "] 我：" in line:
-                        bot_n += 1
+                try:
+                    entry = json.loads(line)
+                    if int(entry.get("ts", 0) or 0) < today_start:
+                        continue
+                    event = entry.get("event")
+                    if event == "arrive":
+                        arrived += int(entry.get("count", 0) or 0)
+                        if entry.get("lag_secs") is not None:
+                            lags.append(int(entry["lag_secs"]))
+                    elif event == "wake":
+                        wakes += 1
+                    elif event == "claim":
+                        wait = entry.get("oldest_wait_secs")
+                        claims += 1
+                        if wait is not None:
+                            waits.append(int(wait))
+                    elif event == "release":
+                        releases += 1
+                except (ValueError, AttributeError, TypeError):
+                    # Same rule as the audit below: a corrupt line is
+                    # skipped, never a crash.
+                    continue
+        out.append(f"hook today: {arrived} msg(s) arrived, {wakes} wake(s), "
+                   f"{claims} claim(s), {releases} release(s)")
+        for label, values in (("pickup lag", lags), ("claim wait", waits)):
+            if values:
+                values.sort()
+                n = len(values)
+                mid = (values[(n - 1) // 2] + values[n // 2]) // 2
+                out.append(f"{label} today: median {mid}s, max {values[-1]}s")
+            else:
+                out.append(f"{label} today: none")
     except OSError:
-        pass
-    out.append(f"chatlog today: {user_n} user / {bot_n} bot lines")
+        out.append("hook today: no events file (hook driver only)")
     ok_n = fail_n = 0
     try:
         with open(SEND_AUDIT_FILE) as f:
@@ -3324,18 +3514,61 @@ def cmd_preflight():
     return 0
 
 
-def _pop_key(args):
-    """Extract a trailing '--key <id>' pair from an argv tail.
-    Returns (key_or_None, remaining_args). A '--key' with no following
-    value is ignored rather than crashing."""
+def _pop_opt(args, name):
+    """Extract a '<name> <value>' pair from an argv tail. Returns
+    (value_or_None, remaining_args). A name with no following value is
+    ignored rather than crashing."""
     rest = list(args)
-    key = None
-    if "--key" in rest:
-        i = rest.index("--key")
+    value = None
+    if name in rest:
+        i = rest.index(name)
         if i + 1 < len(rest):
-            key = rest[i + 1]
+            value = rest[i + 1]
             del rest[i:i + 2]
-    return key, rest
+    return value, rest
+
+
+def _pop_key(args):
+    """Extract a trailing '--key <id>' pair from an argv tail."""
+    return _pop_opt(args, "--key")
+
+
+def _reply_with_lease(lease, key, send):
+    """Reply sends with --lease: the pre-send re-check and the send in
+    one command, so the worker spends no model round on a separate
+    `claim --lease`. Newly pending messages are merged into the claim
+    first; when there are any, nothing is sent: SEND_DEFERRED <n> and
+    the full batch (exit 3) — re-compose and send again. CLAIM_LOST
+    (exit 1) when the claim was taken over. Once the reply is out (or
+    already was), the warm marker goes up: the batch now counts as
+    answered, so without it a follow-up landing before release would
+    wake a second worker. Without a lease the send runs as before.
+
+    A key the ledger already knows means this is the retry after
+    SEND_ERROR (or a repeat): the lease is checked but nothing merged.
+    The first attempt may have been delivered, and a re-composed text
+    under the same client_id would be deduped away by the server —
+    silently leaving the merged messages unanswered. They stay pending
+    for the next round instead."""
+    if not lease:
+        return send()
+    now = int(time.time())
+    try:
+        retry = bool(key) and key in _load_send_ledger()
+    except Exception:
+        retry = True  # unreadable ledger: the send itself fails closed
+    merged = _merge_pending_into(lease, now, merge=not retry)
+    if merged is None:
+        print("CLAIM_LOST")
+        return 1
+    batch, added = merged
+    if added:
+        _print_batch(f"SEND_DEFERRED {added}", batch, now)
+        return 3
+    rc = send()
+    if rc == 0:
+        _raise_warm_marker(int(time.time()))
+    return rc
 
 
 def _int_arg(value, usage):
@@ -3408,15 +3641,28 @@ def main(argv):
                 age = parsed
         return cmd_watchdog(age)
     if cmd == "claim":
-        lease = None
+        usage = "ilink.py claim [--lease <lease>] [--recent] [--with <file>...]"
+        lease, recent, files = None, False, []
         args = argv[2:]
-        if "--lease" in args:
-            i = args.index("--lease")
-            if i + 1 >= len(args):
-                print("usage: ilink.py claim [--lease <lease>]", file=sys.stderr)
+        i = 0
+        while i < len(args):
+            if args[i] == "--lease" and i + 1 < len(args):
+                lease = args[i + 1]
+                i += 2
+            elif args[i] == "--recent":
+                recent = True
+                i += 1
+            elif args[i] == "--with":
+                i += 1
+                while i < len(args) and not args[i].startswith("--"):
+                    files.append(args[i])
+                    i += 1
+            else:
+                # Unknown or incomplete: a mistyped option must not
+                # silently drop the context the worker asked for.
+                print(f"usage: {usage}", file=sys.stderr)
                 return 2
-            lease = args[i + 1]
-        return cmd_claim(lease)
+        return cmd_claim(lease, recent=recent, with_files=files)
     if cmd == "renew":
         if not _need(argv, 3, "ilink.py renew <lease>"):
             return 2
@@ -3458,10 +3704,12 @@ def main(argv):
                 total_mb = parsed
         return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
     if cmd == "send":
-        if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>]"):
+        if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>] [--lease <l>]"):
             return 2
-        key, _ = _pop_key(argv[5:])
-        return cmd_send(argv[2], argv[3], argv[4], key=key)
+        lease, rest = _pop_opt(argv[5:], "--lease")
+        key, _ = _pop_key(rest)
+        return _reply_with_lease(
+            lease, key, lambda: cmd_send(argv[2], argv[3], argv[4], key=key))
     if cmd == "proactive":
         if not _need(argv, 4, "ilink.py proactive <to> <text> [--key <id>]"):
             return 2
@@ -3472,12 +3720,14 @@ def main(argv):
             return 2
         return cmd_typing(argv[2], argv[3])
     if cmd in ("send-image", "send-file", "send-video"):
-        if not _need(argv, 5, f"ilink.py {cmd} <to> <ctx> <path> [--key <id>]"):
+        if not _need(argv, 5, f"ilink.py {cmd} <to> <ctx> <path> [--key <id>] [--lease <l>]"):
             return 2
-        key, _ = _pop_key(argv[5:])
-        return cmd_send_media(argv[2], argv[3], argv[4],
-                              {"send-image": 2, "send-file": 4,
-                               "send-video": 5}[cmd], key=key)
+        lease, rest = _pop_opt(argv[5:], "--lease")
+        key, _ = _pop_key(rest)
+        return _reply_with_lease(
+            lease, key, lambda: cmd_send_media(argv[2], argv[3], argv[4],
+                                          {"send-image": 2, "send-file": 4,
+                                           "send-video": 5}[cmd], key=key))
     if cmd == "send-voice":
         if not _need(argv, 5, "ilink.py send-voice <to> <ctx> <path> [playtime_ms] [--key <id>]"):
             return 2
