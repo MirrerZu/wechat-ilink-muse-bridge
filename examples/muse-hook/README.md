@@ -33,6 +33,10 @@
   一直没人认领的，满 `ILINK_REWAKE_SECS`（默认 180 秒）才补一次。
   以前 pending 在就每轮 wake，一批消息被叫了约 95 次，wake 投递
   积压一个多小时。
+- **队列里有批次也照常收**：不需要叫人的轮次照常 poll，新消息在队列锁里
+  接到 pending 后面，worker 认领或发送前合并时一起拿走。以前 pending 在
+  就不 poll，worker 生成回复期间后到的消息压在服务端，晚到十几秒，还常
+  常逼出一次 `SEND_DEFERRED` 重写。
 - **不重复回复**：认领用 `ilink.py claim`（加锁，与本脚本共用
   `ilink-queue.lock`），第二个 worker 拿到 `CLAIM_BUSY`，不读任何
   上下文就退出。冷启动的 worker 用 `claim --recent --with <今天的日志>`

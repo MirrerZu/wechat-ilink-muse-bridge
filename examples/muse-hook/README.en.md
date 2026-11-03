@@ -39,6 +39,12 @@ WeChat user ──message──> iLink server
   re-woken only after `ILINK_REWAKE_SECS` (default 180). The old
   "wake every round while pending exists" produced ~95 wakes for one
   batch and backed up wake delivery for over an hour.
+- **Polling goes on behind a queued batch**: a round that wakes no one
+  still polls, and new messages are appended to pending under the queue
+  lock, so the worker gets them with its claim or its pre-send merge.
+  The old "no poll while pending exists" left messages sent during
+  composing on the server for a dozen seconds, often forcing one more
+  `SEND_DEFERRED` rewrite.
 - **No duplicate replies**: the worker claims with `ilink.py claim`
   (locked, shared with this script through `ilink-queue.lock`): a
   second worker gets `CLAIM_BUSY` and exits before reading any

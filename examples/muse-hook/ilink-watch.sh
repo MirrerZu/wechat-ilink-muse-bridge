@@ -30,6 +30,8 @@
 #     自己合并 pending）时不 wake；同一批无人认领满 ILINK_REWAKE_SECS
 #     （默认 180 秒）才补一次。以前 pending 在就每轮 wake，wake 投递
 #     排队积压一个多小时，真消息的 wake 排在一堆重复 wake 后面
+#   - pending 里有批次、本轮又不用叫人时照常 poll，新消息持队列锁接到
+#     pending 后面（以前 pending 在就不 poll，后到的消息晚十几秒）
 #   - worker 用 ilink.py claim/renew/release 认领（与本脚本共用
 #     ilink-queue.lock）；超时认领连同旧版 worker 自建的
 #     ilink-processing-*.json 一起处理：已回复的直接删，未回复的并回
@@ -347,16 +349,22 @@ if [ -s "$PENDING" ] && [ "${pending_msgs:-0}" -eq 0 ]; then
 fi
 exec 7>&-
 
-# 有未处理的消息（上一轮拉到、还没人认领）：决定要不要叫人，不再拉新的
+# 有未处理的消息（上一轮拉到、还没人认领）：先决定要不要叫人。要叫就
+# 叫，本轮到此为止；不用叫（守候的 worker、开着的认领、刚叫起的 worker
+# 都会把 pending 收走）就照常 poll，新消息接到 pending 后面。以前这里
+# 一律不 poll：worker 生成回复的几十秒里后到的消息全压在服务端，等它
+# 并走 pending 才拉下来，常常又逼出一次 SEND_DEFERRED 重写（2026-11-03，
+# 一句文字因此晚到 17 秒）。
+held=""
 if [ "${pending_msgs:-0}" -gt 0 ]; then
   cnt=$pending_msgs
   sig=$(batch_sig "$PENDING")
   if warm_alive; then
-    silent "warm worker on duty"
+    held="warm worker on duty"
   elif claim_active; then
-    silent "worker holds an open claim, it merges pending before sending"
+    held="worker holds an open claim, it merges pending before sending"
   elif ago=$(woken_ago "$sig") && [ "$ago" -lt "$REWAKE_SECS" ]; then
-    silent "woken ${ago}s ago for this batch, waiting for a claim"
+    held="woken ${ago}s ago for this batch, waiting for a claim"
   else
     light_typing "$PENDING"
     # 卡住告警：积压起点距今 >=10 分钟且距上次告警 >=1 小时，随 wake 带出
@@ -371,12 +379,13 @@ if [ "${pending_msgs:-0}" -gt 0 ]; then
     mark_woken "$sig"
     hook_event wake "{\"reason\":\"pending_wechat_messages\",\"sig\":\"$sig\",\"count\":$cnt}"
     wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
+    exit 0  # wake 是本轮最后一步
   fi
-  # 分支已结束（wake/silent 为最后调用）
-elif ! flush_commit_pending; then
+fi
+if ! flush_commit_pending; then
   # 上一轮的 commit 还没补交成功：本轮不 poll，避免新批次与未提交的
   # 旧批次交叠（补交成功后旧批次的游标才推进，届时正常拉新消息）
-  silent "commit retry pending, poll skipped"
+  silent "commit retry pending, poll skipped${held:+; $held}"
 else
   # 长轮询一轮（服务端 hold 住最多 35s）。timeout 120 封顶：poll 本身
   # 是纯拉取（不推进游标、不记去重），超时只是本轮无结果、下轮重拉，
@@ -445,8 +454,9 @@ else
     recovered=""
     exp_since=$(astate exp_since)
     err_since=$(astate err_since)
-    # 卡住事件收尾：队列已排空（无 pending 才进本分支）且无人处理中，清状态
-    if [ ! -f "$PROC" ] && [ "$(astate stuck_since)" -gt 0 ]; then
+    # 卡住事件收尾：队列已排空（本轮开始时没有 pending）且无人处理中，清状态
+    if [ "${pending_msgs:-0}" -eq 0 ] && [ ! -f "$PROC" ] \
+       && [ "$(astate stuck_since)" -gt 0 ]; then
       aset stuck_since 0
       aset stuck_last 0
     fi
@@ -486,10 +496,24 @@ else
         # dry 不落盘、不提交：消息留给正式轮询去拉，避免重复入队
         silent "dry-run: $cnt messages fetched, left uncommitted for live poll"
       else
-        # 原子写入 pending（只写 msgs，保持队列文件既有格式）
+        # 原子写入 pending（只写 msgs，保持队列文件既有格式）。pending 里
+        # 可能还有本轮带着 poll 的上一批：持队列锁把新消息接在后面，与
+        # claim 互斥——不持锁时 worker 恰好认领，旧批会被写回 pending 再
+        # 答一遍。拿不到锁就不 commit，这批下一轮重拉。
+        exec 7>"$STATE_DIR/ilink-queue.lock"
+        if ! flock -w 30 7; then
+          silent "queue lock busy, $cnt messages left uncommitted for the next poll"
+          exit 0
+        fi
         tmp="$PENDING.tmp.$$"
-        printf '%s' "$out" | jq -c '{msgs}' > "$tmp"
+        if [ -s "$PENDING" ]; then
+          printf '%s' "$out" | jq -c --slurpfile p "$PENDING" '{msgs: ($p[0].msgs + .msgs)}' > "$tmp"
+        else
+          printf '%s' "$out" | jq -c '{msgs}' > "$tmp"
+        fi
         mv "$tmp" "$PENDING"
+        total=$(queue_count "$PENDING")
+        exec 7>&-
         log "received $cnt messages"
         # Light the "typing..." indicator the moment the batch lands (owner
         # only) instead of waiting for the worker agent to boot — the worker's
@@ -510,17 +534,23 @@ else
           2>/dev/null || true)
         lag_field=""
         case "$lag" in ''|*[!0-9]*) ;; *) lag_field=",\"lag_secs\":$lag" ;; esac
-        hook_event arrive "{\"sig\":\"$sig\",\"count\":$cnt,\"poll_secs\":$((NOW - poll_t0))$lag_field}"
+        # arrive 记本轮新消息的首条 id（pending 可能还挂着上一批，队首是它的）
+        arr_sig=$(printf '%s' "$out" | jq -r '.msgs[0].message_id // empty | tostring' 2>/dev/null || true)
+        hook_event arrive "{\"sig\":\"$arr_sig\",\"count\":$cnt,\"poll_secs\":$((NOW - poll_t0))$lag_field}"
         if [ -z "$recovered" ] && warm_alive; then
           # 守候中的 worker 会在数秒内自己认领；带 recovered 时照常 wake，
           # 免得恢复通知被吞掉（多叫的 worker 由 claim 返回 CLAIM_BUSY 退出）
           silent "warm worker on duty"
         elif [ -z "$recovered" ] && claim_active; then
           silent "worker holds an open claim, it merges the new batch before sending"
+        elif [ -z "$recovered" ] && ago=$(woken_ago "$sig") \
+             && [ "$ago" -lt "$REWAKE_SECS" ]; then
+          # 接在刚叫起、还没认领的那批后面：签名是首条 id，不变，不再叫一个
+          silent "woken ${ago}s ago for this batch, waiting for a claim"
         else
           mark_woken "$sig"
-          hook_event wake "{\"reason\":\"new_wechat_messages\",\"sig\":\"$sig\",\"count\":$cnt}"
-          wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
+          hook_event wake "{\"reason\":\"new_wechat_messages\",\"sig\":\"$sig\",\"count\":$total}"
+          wake "new_wechat_messages" "{\"count\":$total,\"pending_file\":\"$PENDING\"$rec_extra}"
         fi
       fi
     elif [ -n "$recovered" ]; then
@@ -532,7 +562,7 @@ else
       fi
     else
       do_commit
-      silent "no new messages"
+      silent "no new messages${held:+; $held}"
     fi
   fi
 fi

@@ -215,9 +215,11 @@ class HookIntegrationTest(unittest.TestCase):
         with open(pend_path, "w") as f:
             json.dump({"msgs": [{"from_user_id": "owner1", "message_id": 21}]}, f)
         self.write_warm()
-        calls = self.run_hook()
+        calls = self.run_hook(EMPTY)
         self.assertNotIn("WAKE", calls)
         self.assertIn("warm worker on duty", calls)
+        # Held, not a reason to stop polling: the round polled and committed
+        self.assertIn("SILENT no new messages; warm worker on duty", calls)
 
     def test_stale_warm_marker_rearms_wake(self):
         # Heartbeat older than 45s = the warm worker died; the script

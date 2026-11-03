@@ -25,6 +25,9 @@ Hook (examples/muse-hook/ilink-watch.sh, against a fake ilink.py):
     worker; one past its session cap does not
   * the background typing child does not take the round locks with
     it, so the round after a batch is not skipped
+  * a queued batch that needs no wake no longer stops polling: new
+    messages are appended behind it, a batch claimed during the poll
+    is not written back, and a woken batch is not woken again
   * ilink-hook.env next to the script sets the deployment's paths
     (for hook definitions without an environment field)
 
@@ -76,6 +79,9 @@ with open(trace, "a") as f:
     f.write("ILINK " + " ".join(sys.argv[1:]) + "\n")
 if cmd == "poll":
     time.sleep(float(os.environ.get("FAKE_POLL_DELAY", "0")))
+    grab = os.environ.get("FAKE_CLAIM_DURING_POLL")
+    if grab:  # a worker claims the queued batch while the poll is held
+        os.replace(grab, grab.replace("pending", "processing"))
     print(os.environ.get("FAKE_OUT", ""))
 elif cmd == "commit":
     sys.stdin.read()
@@ -155,7 +161,7 @@ class HookWakeTest(unittest.TestCase):
             calls = self.run_hook()
         self.assertEqual(len(self.wakes(calls)), 1, calls)
         self.assertIn("waiting for a claim", calls)
-        self.assertNotIn("ILINK poll", calls)  # still queued: no new poll
+        self.assertIn("ILINK poll", calls)  # a queued batch no longer stops polling
         calls = self.run_hook(extra_env={"ILINK_REWAKE_SECS": "0"})
         self.assertEqual(len(self.wakes(calls)), 2, calls)
 
@@ -320,6 +326,45 @@ class HookWakeTest(unittest.TestCase):
             self.assertEqual(json.load(f)["since"], old)
         calls = self.run_hook(BATCH)
         self.assertEqual(len(self.wakes(calls)), 1, calls)
+
+    def pending_ids(self):
+        with open(self.p("ilink-pending.json")) as f:
+            return [m["message_id"] for m in json.load(f)["msgs"]]
+
+    def test_held_batch_keeps_polling_new_messages_behind_it(self):
+        # Production 2026-11-03: rounds with a queued batch did not poll,
+        # so a text sent while the worker composed sat on the server for
+        # 17 s and then forced another SEND_DEFERRED rewrite.
+        self.write("ilink-pending.json", _msgs(1))
+        with mock.patch.dict(os.environ, {"ILINK_HOOK_STATE_DIR": self.state}):
+            ilink._raise_warm_marker(int(time.time()))
+        calls = self.run_hook(BATCH)
+        self.assertEqual(self.wakes(calls), [])
+        self.assertIn("warm worker on duty", calls)
+        self.assertEqual(self.pending_ids(), [1, 7])
+        arrive = self.arrive_event()
+        self.assertEqual((arrive["count"], arrive["sig"]), (1, "7"))  # new ones
+
+    def test_messages_behind_a_woken_batch_wake_no_one_else(self):
+        self.write("ilink-pending.json", _msgs(1))
+        calls = self.run_hook(EMPTY)
+        self.assertEqual(len(self.wakes(calls)), 1, calls)
+        self.assertNotIn("ILINK poll", calls)  # a round that wakes ends there
+        calls = self.run_hook(BATCH)
+        self.assertEqual(len(self.wakes(calls)), 1, calls)
+        self.assertIn("waiting for a claim", calls)
+        self.assertEqual(self.pending_ids(), [1, 7])
+
+    def test_batch_claimed_during_the_poll_is_not_written_back(self):
+        self.write("ilink-pending.json", _msgs(1))
+        with mock.patch.dict(os.environ, {"ILINK_HOOK_STATE_DIR": self.state}):
+            ilink._raise_warm_marker(int(time.time()))
+        self.run_hook(BATCH, extra_env={
+            "FAKE_CLAIM_DURING_POLL": self.p("ilink-pending.json")})
+        self.assertEqual(self.pending_ids(), [7])
+        with open(self.p("ilink-processing.json")) as f:
+            self.assertEqual([m["message_id"] for m in json.load(f)["msgs"]],
+                             [1])
 
     def test_background_typing_does_not_hold_the_round_lock(self):
         # Production 2026-11-03: the typing child inherited the lock fds,
