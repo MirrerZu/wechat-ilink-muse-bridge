@@ -203,6 +203,18 @@ class MediaItemBuildTest(unittest.TestCase):
         self.assertEqual(item["video_item"]["video_size"], 128)
         self.assertIs(item["video_item"]["media"], self.UP["media"])
 
+    def test_voice_item(self):
+        # The channel silently drops outbound voice (verified live
+        # 2026-10-22); this only pins the shape in case it ever delivers.
+        item = ilink._media_item("/tmp/x.silk", self.UP, 3, playtime_ms=4560)
+        self.assertEqual(item["type"], 3)
+        v = item["voice_item"]
+        self.assertIs(v["media"], self.UP["media"])
+        self.assertEqual(v["encode_type"], 6)  # SILK
+        self.assertEqual(v["sample_rate"], 24000)
+        self.assertEqual(v["bits_per_sample"], 16)
+        self.assertEqual(v["playtime"], 4560)
+
     def test_image_and_file_items_unchanged(self):
         img = ilink._media_item("/tmp/x.jpg", self.UP, 2)
         self.assertEqual(img["image_item"]["mid_size"], 128)

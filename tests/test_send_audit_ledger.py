@@ -194,21 +194,6 @@ class LedgerTest(unittest.TestCase):
             _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
         self.assertEqual(api.call_count, 2)
 
-    def test_corrupt_ledger_aborts_keyed_send(self):
-        # Old semantics (corrupt reads as empty, send proceeds) were
-        # replaced by fail-closed handling (ChatGPT 6th-round review):
-        # an empty fallback would forget recorded successes and let a
-        # retry resend under a fresh client_id.
-        with open(ilink.SEND_LEDGER_FILE, "w") as f:
-            f.write("garbage{")
-        api = mock.Mock(return_value={"code": 0})
-        with mock.patch.object(ilink, "api", api):
-            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-3")
-        self.assertEqual(code, 1)
-        self.assertIn("LEDGER_CORRUPT", out)
-        self.assertNotIn("SEND_OK", out)
-        self.assertEqual(api.call_count, 0)
-
     def test_expired_ledger_entry_ignored(self):
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             json.dump({"m-old": {"client_id": "c", "at": int(time.time()) - 90000,

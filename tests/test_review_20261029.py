@@ -67,9 +67,6 @@ def _pin_paths():
     ilink.SEND_AUDIT_FILE = os.path.join(DATA_DIR, "send_audit.jsonl")
     ilink.QUOTE_CACHE_FILE = os.path.join(DATA_DIR, "quote_cache.json")
     ilink.MEDIA_DIR = os.path.join(DATA_DIR, "media")
-    ilink.VERSION_NOTIFY_FILE = os.path.join(DATA_DIR, "version_notify.json")
-    ilink.VERSION_NOTIFY_LOCK_FILE = os.path.join(DATA_DIR, "version_notify.lock")
-    ilink.UPDATE_OFFER_FILE = os.path.join(DATA_DIR, "update_offer.json")
     os.environ["ILINK_HOOK_STATE_DIR"] = STATE_DIR
 
 

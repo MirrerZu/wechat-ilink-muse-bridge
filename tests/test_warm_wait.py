@@ -55,6 +55,10 @@ class WarmWaitTest(unittest.TestCase):
         self.assertIsNone(self.marker())
 
     def test_new_messages_exit_keeps_marker(self):
+        # The deadline is counted in whole seconds, so an idle of N gives
+        # a real window of N-1..N seconds. With 2, a start late in a second
+        # timed out at ~1.0s, before the batch below lands at 1.2s.
+        self.env["ILINK_WARM_IDLE"] = "5"
         proc = subprocess.Popen(["bash", HELPER], env=self.env,
                                 stdout=subprocess.PIPE, text=True)
         time.sleep(1.2)
